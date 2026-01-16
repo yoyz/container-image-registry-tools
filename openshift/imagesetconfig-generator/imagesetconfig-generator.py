@@ -12,7 +12,7 @@ import signal
 import time
 
 # --- Global Configuration ---
-VERSION = "0.1"
+VERSION = "0.11"
 
 # --- Helper Utilities ---
 
@@ -193,6 +193,11 @@ Examples of usage:
     args = parser.parse_args()
 
     print(f"--- ImageSetConfiguration Generator v{VERSION} ---")
+    if not (args.fetch or args.extract or args.generate):
+        print("\n[!] ACTION REQUIRED: You must specify at least one action.")
+        print("    Please use one or more of: --fetch, --extract, --generate")
+        print("    Run with -h for full usage details.\n")
+        sys.exit(1)
 
     config_path = args.configs if args.configs else os.path.join('/tmp', get_safe_dirname(args.catalog))
 
