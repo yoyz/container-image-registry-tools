@@ -6,6 +6,7 @@ A collection of Python-based utilities for managing container registries (Docker
 
 1.  **Registry List Tool** `quayregistryclient`
     * *Purpose:* A CLI for deep inspection and administration of registry content (Tags, Manifests, Blobs) with specific support for Red Hat Quay.
+    * *similar:* This tool is similar to ``skopeo`` and ``regctl-linux-amd64``.
 2.  **ImageSetConfiguration Generator** `imagesetconfig-generator.py`
     * *Purpose:* Automates the creation of `ImageSetConfiguration` YAML files for `oc-mirror` by reverse-engineering an existing Operator Catalog.
 3.  **Quay Space Consumption tool** 
