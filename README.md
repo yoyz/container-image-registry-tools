@@ -4,14 +4,15 @@ A collection of Python-based utilities for managing container registries (Docker
 
 ## 📂 Tools Included
 
-1.  **Registry List Tool** (`quayregistryclient`)
+1.  **Registry List Tool** `quayregistryclient`
     * *Purpose:* A CLI for deep inspection and administration of registry content (Tags, Manifests, Blobs) with specific support for Red Hat Quay.
-2.  **ImageSetConfiguration Generator** (`imagesetconfig-generator.py`)
+2.  **ImageSetConfiguration Generator** `imagesetconfig-generator.py`
     * *Purpose:* Automates the creation of `ImageSetConfiguration` YAML files for `oc-mirror` by reverse-engineering an existing Operator Catalog.
-
+3.  **Quay Space Consumption tool** 
+    * *Purpose:* accurately calculate the **physical storage consumption** of Red Hat Quay and Docker V2 registries.
 ---
 
-## 🛠️ Tool 1: Registry List (`quayregistryclient`)
+## 🛠️ QuayRegistryClient (`quayregistryclient.py`)
 
 A Swiss Army knife for registry admin. 
 It allows you to list repositories, inspect image internals (digests, manifests), and perform removal operations.
@@ -44,7 +45,7 @@ It allows you to list repositories, inspect image internals (digests, manifests)
 
 ---
 
-## ⚙️ Tool 2: ImageSetConfig Generator (`imagesetconfig-generator.py`)
+## ⚙️ ImageSetConfig Generator (`imagesetconfig-generator.py`)
 
 Generating `ImageSetConfiguration` files for disconnected OpenShift clusters (using `oc-mirror`) is often a manual, error-prone process. This tool automates it by pulling a Catalog Image and extracting its internal File-Based Catalog (FBC) data.
 
@@ -75,6 +76,40 @@ Generating `ImageSetConfiguration` files for disconnected OpenShift clusters (us
   --v1
 
 ```
+
+##  🛠 Quay Space Consumption (`quayspaceconsumption.py`)
+
+A Python script to accurately calculate the **physical storage consumption** of Red Hat Quay and Docker V2 registries.
+This script was largely developped using AI tool, with a lot of tweak here and there to ensure correctness of the output.
+
+
+Run the tool :
+
+```bash
+python3 quayspaceconsumption.py -u https://quay.example.com -f repos.txt
+
+```
+
+```text
+ARCHITECTURE BREAKDOWN (Deduplicated within Arch)
+----------------------------------------------------------------
+linux/amd64          | 1030,23 MiB
+linux/arm64          | 1006,81 MiB
+linux/ppc64le        | 1097,61 MiB
+linux/s390x          | 1002,85 MiB
+
+REPOSITORY SUMMARY
+----------------------------------------------------------------
+ubi9/httpd-24                                      | 3794,94 MiB
+ubi8/ubi                                           | 299,41 MiB
+ubi8/ubi-micro                                     | 43,15 MiB
+----------------------------------------------------------------
+FINAL TOTAL (Deduplicated physical storage): 4137,50 MiB
+
+```
+
+
+
 
 ## 📝 Configuration
 
