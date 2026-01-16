@@ -1,6 +1,3 @@
-### `README.md`
-
-```markdown
 # Container Image Registry Tools
 
 A collection of Python-based utilities for managing container registries (Docker Distribution/Quay), inspecting images, and generating configurations for OpenShift mirroring.
