@@ -12,7 +12,7 @@ import signal
 import time
 
 # --- Global Configuration ---
-VERSION = "0.11"
+VERSION = "0.13"
 
 # --- Helper Utilities ---
 
@@ -93,31 +93,58 @@ def handle_extract(catalog, dest_path):
         if container_id:
             subprocess.run(['podman', 'rm', '-f', container_id], capture_output=True)
 
-def handle_parse_fbc(config_dir):
+def handle_parse_fbc(config_dir, verbose=False):
     """Walks the config directory and builds a map of packages and channels."""
     pkg_map = {}
     print(f"\n{'STATUS':<12} | {'OPERATOR':<35} | {'CHANNEL/VERSION'}")
     print("-" * 80)
     for root, _, files in os.walk(config_dir):
         for file in files:
-            if file.endswith(('.json', '.yaml', '.yml')):
-                with open(os.path.join(root, file), 'r') as f:
-                    for doc in extract_json_objects(f.read()):
-                        if not isinstance(doc, dict): continue
-                        if doc.get('schema') == 'olm.package':
-                            name = doc.get('name')
-                            if name:
-                                if name not in pkg_map: pkg_map[name] = {"channels": set(), "default": None}
-                                pkg_map[name]["default"] = doc.get('defaultChannel')
-                                print(f"{'PACKAGE':<12} | {name:<35} | Default: {doc.get('defaultChannel')}")
-                        elif doc.get('schema') == 'olm.channel':
-                            pkg = doc.get('package')
-                            chan = doc.get('name')
-                            if pkg and chan:
-                                if pkg not in pkg_map: pkg_map[pkg] = {"channels": set(), "default": None}
-                                if chan not in pkg_map[pkg]["channels"]:
-                                    pkg_map[pkg]["channels"].add(chan)
-                                    print(f"{'CHANNEL':<12} | {pkg:<35} | -> {chan}")
+            file_path = os.path.join(root, file)
+            parser = None
+            
+            # Identify target files
+            is_target = file.endswith(('.json', '.yaml', '.yml'))
+            
+            if verbose and is_target:
+                print(f"Reading {file_path} ...", end='', flush=True)
+
+            # Select parser based on file extension
+            if file.endswith('.json'):
+                parser = lambda f: extract_json_objects(f.read())
+            elif file.endswith(('.yaml', '.yml')):
+                parser = lambda f: yaml.safe_load_all(f)
+            
+            if parser:
+                if verbose:
+                    print(" OK")
+                try:
+                    with open(file_path, 'r') as f:
+                        for doc in parser(f):
+                            if not isinstance(doc, dict): continue
+                            if doc.get('schema') == 'olm.package':
+                                name = doc.get('name')
+                                if name:
+                                    if name not in pkg_map: pkg_map[name] = {"channels": set(), "default": None}
+                                    pkg_map[name]["default"] = doc.get('defaultChannel')
+                                    if not verbose:
+                                        print(f"{'PACKAGE':<12} | {name:<35} | Default: {doc.get('defaultChannel')}")
+                            elif doc.get('schema') == 'olm.channel':
+                                pkg = doc.get('package')
+                                chan = doc.get('name')
+                                if pkg and chan:
+                                    if pkg not in pkg_map: pkg_map[pkg] = {"channels": set(), "default": None}
+                                    if chan not in pkg_map[pkg]["channels"]:
+                                        pkg_map[pkg]["channels"].add(chan)
+                                        if not verbose:
+                                            print(f"{'CHANNEL':<12} | {pkg:<35} | -> {chan}")
+                except Exception as e:
+                    if verbose: print(f" FAIL ({e})")
+                    else: print(f"Warning: Could not parse {file}: {e}")
+            elif verbose and is_target:
+                # Should not happen given is_target logic, but good for safety
+                print(" SKIP (No Parser)")
+
     return pkg_map
 
 def write_image_set_config(output_file, catalog, pkg_map, version='v1'):
@@ -165,8 +192,8 @@ Examples of usage:
   2. Handle GPG signature failures on RHEL bastion:
      ./imagesetconfig-generator.py -c registry.redhat.io/... --fetch --tls-verify false --disable-signature-policy
 
-  3. Generate from an existing local config folder:
-     ./imagesetconfig-generator.py -c my.registry/catalog:v1 --generate output.yaml --configs /tmp/my_configs --v1
+  3. Generate from an existing local config folder with verbose logging:
+     ./imagesetconfig-generator.py -c my.registry/catalog:v1 --generate output.yaml --configs /tmp/my_configs --v1 --verbose
 
   4. Extended timeout for slow registry connections:
      ./imagesetconfig-generator.py -c registry.redhat.io/... --fetch --timeout 1800
@@ -185,6 +212,7 @@ Examples of usage:
     parser.add_argument('--timeout', type=int, default=600, help='Timeout for podman pull (default: 600s)')
     parser.add_argument('--tls-verify', type=str2bool, default=True, help='Toggle TLS verification (true/false)')
     parser.add_argument('--disable-signature-policy', action='store_true', help='Bypass GPG signature checks')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose logging of file processing')
     
     v_group = parser.add_mutually_exclusive_group()
     v_group.add_argument('--v1', action='store_true', help='Generate for oc-mirror v1 (v1alpha2)')
@@ -213,7 +241,7 @@ Examples of usage:
             sys.exit(1)
         
         mirror_version = 'v2' if args.v2 else 'v1'
-        pkg_map = handle_parse_fbc(config_path)
+        pkg_map = handle_parse_fbc(config_path, verbose=args.verbose)
         write_image_set_config(args.generate if args.generate.endswith('.yaml') else args.generate + '.yaml', 
                                args.catalog, pkg_map, version=mirror_version)
 
