@@ -11,6 +11,8 @@ DEFAULT_PROTOCOL="https://"
 EXIT_TAG_NOT_FOUND=3
 ssl_already_verified=0
 debug=None
+VERSION = "0.1"
+
 
 def signal_handler(sig, frame):
     sys.exit(0)
@@ -552,6 +554,7 @@ def get_registry_password(file_path, registry_url):
     
 def display_help():
     print("Usage: %s     " % (sys.argv[0] ))
+    print(f"Version: {VERSION}")
     print("Command       ")
     print("  get-server-certificate  : display the pem file of the server ")
     print("  browse-api              : query quay api and display the json ")
@@ -604,6 +607,7 @@ def main():
     key=None
     value=None
     digest=None
+    i_am_deleting_all_repo=False
     global debug
     
     for o, a in opts:
@@ -746,6 +750,10 @@ def main():
                 print("This is a destructive operation that will wipe the entire registry.")
                 print("To proceed, you must strictly add the flag: --i-am-deleting-all-repo")
                 sys.exit(1)
+            if not all([registry_url, username, password,Port,token]):
+                password="##maskingPassword##" if password is not None else password
+                print(f"Error: missing parameters delete-all-repo(registry_url={registry_url},Port={Port},token={token}")
+                sys.exit(2)
             deleteallrepo(registry_url, username, password,Port,token)
         else:
             if len(args)!=0:
