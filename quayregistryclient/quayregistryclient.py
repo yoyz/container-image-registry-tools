@@ -11,7 +11,7 @@ DEFAULT_PROTOCOL="https://"
 EXIT_TAG_NOT_FOUND=3
 ssl_already_verified=0
 debug=None
-VERSION = "0.1"
+VERSION = "0.2"
 
 
 def signal_handler(sig, frame):
@@ -23,9 +23,13 @@ def printstderr(mystr):
     print(mystr, file=sys. stderr)
     
 def getservercertificate(registry_url, Port):
-    if checkhttpsconnection(registry_url, Port):
+    #if checkhttpsconnection(registry_url, Port):
+    try:
         cert_pem = ssl.get_server_certificate((registry_url,Port))
-        print(cert_pem)
+    except: 
+        print(f"Error: Could not connect to {registry_url} on port {Port}.")
+        sys.exit(1) 
+    print(cert_pem)
 
 def checkhttpsconnection(registry_url, port):
     global ssl_already_verified
@@ -652,9 +656,18 @@ def main():
             username=mydict["username"]
             password=mydict["password"]
 
-    # Force the port to be 443 if it is not supplied by user
-    if Port==None:
+
+    if "https://" in registry_url:
+        registry_url = registry_url.replace("https://", "")
         Port=443
+
+    # We capture the port in group 1, but we target the whole ':digits/' for replacement
+    pattern = r':(\d+)/$'
+    match = re.search(pattern, registry_url)
+    if match:
+        Port = match.group(1)
+        registry_url = registry_url.replace(match.group(0), "")
+    
     if tag==None:
         tag="latest"
         
@@ -735,14 +748,23 @@ def main():
         # GET a blob from a blob digest for a given image
         elif a == "list-digest":
             if not all([registry_url, username, password,Port,imageName,token]):
-                print("Error: missing parameters")
+                print("Error: missing parameters list-digest(registry_url={registry_url},username={username},password={password},Port={Port},imageName={imageName},token={token})")
                 sys.exit(2)
             listdigest(registry_url, username, password,Port,imageName,token)           
         elif a == "delete-repo":
+            if not all([registry_url,imageName,token]):
+                print(f"Error: missing parameters delete-repo(registry_url={registry_url},imageName={imageName},token={token})")
+                sys.exit(2)
             deleterepo(registry_url, Port,imageName,token)
         elif a == "delete-tag":
+            if not all([registry_url, Port,imageName,token,tag]):
+                print(f"Error: missing parameters delete-tag(registry_url={registry_url},Port={Port},imageName={imageName},token={token},tag={tag})")
+                sys.exit(2)
             deletetag(registry_url, Port,imageName,token,tag)            
-        elif a == "set-api-key-value":
+        elif a == "set-api-key-value":  
+            if not all([registry_url, Port,token,apipath,key,value]):
+                print(f"Error: missing parameters set-api-key-value(registry_url={registry_url},Port={Port},token={token},apipath={apipath},key={key},value={value})")
+                sys.exit(2)
             setapikeyvalue(registry_url, Port,token,apipath,key,value)
         elif a == "delete-all-repo":
             if not i_am_deleting_all_repo:
