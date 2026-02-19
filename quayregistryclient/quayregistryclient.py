@@ -311,6 +311,7 @@ def fetch_catalog_v2_token(registry_url,Port,token):
     # Set the headers with authentication
     more_image=1
 
+    # if we have a token try to use it in the headers
     if token!=None:
         headers = {
             'Content-Type': 'application/json',
