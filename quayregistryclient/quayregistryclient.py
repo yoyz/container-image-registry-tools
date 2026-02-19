@@ -23,13 +23,47 @@ def printstderr(mystr):
     print(mystr, file=sys. stderr)
     
 def getservercertificate(registry_url, Port):
-    #if checkhttpsconnection(registry_url, Port):
     try:
-        cert_pem = ssl.get_server_certificate((registry_url,Port))
-    except: 
-        print(f"Error: Could not connect to {registry_url} on port {Port}.")
-        sys.exit(1) 
-    print(cert_pem)
+        # 1. Setup context to ignore validation so we can grab the certs anyway
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        pem_chain = []  
+
+        # 3. Connect and wrap the socket
+        with socket.create_connection((registry_url, int(Port)), timeout=10) as sock:
+            with context.wrap_socket(sock, server_hostname=registry_url) as ssock: 
+                
+                # 4. Use get_unverified_chain() for Python 3.10+
+                chain = ssock.get_unverified_chain()
+                
+                if not chain:
+                    print("No certificates returned by the server.")
+                    return None
+                
+                # Convert each DER certificate in the chain to PEM
+                for cert in chain:
+                    pem_cert = ssl.DER_cert_to_PEM_cert(cert)
+                    pem_chain.append(pem_cert)
+        
+        cert_pem = "\n".join(pem_chain)
+        
+        print(cert_pem)
+
+        if checkhttpsconnection(registry_url,Port)==0:
+            printstderr("You might want to add it to your system trust store by adding it to")
+            printstderr("/etc/pki/ca-trust/source/anchors/")
+            printstderr("and running 'sudo update-ca-trust'")
+        else:
+            printstderr("This server certificate is trusted locally.")
+        return cert_pem
+
+    except Exception as e: 
+        # 6. Catch the actual exception 'e' so you know exactly what broke
+        print(f"Error: Could not retrieve certificates from {registry_url} on port {Port}.")
+        print(f"Details: {e}")
+        sys.exit(1)
 
 def checkhttpsconnection(registry_url, port):
     global ssl_already_verified
@@ -40,7 +74,7 @@ def checkhttpsconnection(registry_url, port):
         ssl_already_verified=1
         return(ssl_already_verified)
     except requests.exceptions.SSLError:
-        printstderr("Error: The server certificate is NOT trusted locally.")
+        printstderr("The server certificate is NOT trusted locally.")
         return(0)
     except requests.exceptions.RequestException as e:
         printstderr(f"An unrelated error occurred: {e}")
@@ -104,6 +138,11 @@ def browseapi(registry_url,Port,token,apipath):
 def listcatalog(registry_url, username, password,Port):
     if checkhttpsconnection(registry_url,Port)==0:
         return(0)
+
+    catalog_url = f"{registry_url}:{Port}/v2/_catalog"
+    response = requests.get(catalog_url)
+    if response.status_code == 200:
+        printstderr("200 OK")
 
     token=getToken(registry_url, username, password,Port)
     images=fetch_catalog_v2(registry_url, username, password,Port,token)
@@ -700,8 +739,8 @@ def main():
             
         # list catalog v2
         elif a == "list-catalog":
-            if not all([registry_url, username, password,Port]):
-                print("Error: missing parameters")
+            if not all([registry_url, Port]):
+                print(f"Error: missing parameters list-catalog(registry_url={registry_url},Port={Port})")
                 sys.exit(2)
             listcatalog(registry_url, username, password,Port)
 
