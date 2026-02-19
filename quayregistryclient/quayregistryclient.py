@@ -21,7 +21,7 @@ def signal_handler(sig, frame):
 
 def printstderr(mystr):
     print(mystr, file=sys. stderr)
-    
+
 def getservercertificate(registry_url, Port):
     try:
         # 1. Setup context to ignore validation so we can grab the certs anyway
@@ -585,32 +585,49 @@ def deleteallrepo(registry_url,username,password,Port,token):
         deleterepo(registry_url,Port,image,token)
 
 
-def get_registry_password(file_path, registry_url):
+
+def get_registry_password(file_path, registry_host):
     """
-    Extracts credentials from ~/.docker/config.json OR a K8s pull-secret file.
+    Extracts credentials from ~/.docker/config.json or compatible files.
     Returns: {'username': '...', 'password': '...'} or {} if not found.
     """
-    # Expand path (handles ~/ paths)
     file_path = os.path.expanduser(file_path)
-    
+    if not os.path.exists(file_path):
+        return {}
+
     try:
         with open(file_path, 'r') as f:
             config_json = json.load(f)
 
         auths = config_json.get("auths", {})
-        reg_data = auths.get(registry_url)
+        
+        # Try exact match first, then try appending/removing https://
+        keys_to_try = [
+            registry_host,
+            f"https://{registry_host}",
+            f"http://{registry_host}",
+            registry_host.replace("https://", "").replace("http://", "")
+        ]
 
+        reg_data = None
+        for k in keys_to_try:
+            if k in auths:
+                reg_data = auths[k]
+                break
+        
         if not reg_data:
             return {}
 
-        # 3. Handle 'auth' string (Base64 encoded "user:pass")
+        # Handle 'auth' string (Base64 encoded "user:pass")
         if "auth" in reg_data:
-            decoded_auth = base64.b64decode(reg_data["auth"]).decode('utf-8')
-            if ":" in decoded_auth:
-                username, password = decoded_auth.split(":", 1)
-                return {"username": username, "password": password}
+            try:
+                decoded_auth = base64.b64decode(reg_data["auth"]).decode('utf-8')
+                if ":" in decoded_auth:
+                    username, password = decoded_auth.split(":", 1)
+                    return {"username": username, "password": password}
+            except Exception: pass
 
-        # 4. Handle explicit keys (sometimes used in custom configs)
+        # Handle explicit keys
         if "username" in reg_data and "password" in reg_data:
             return {
                 "username": reg_data["username"],
@@ -618,10 +635,9 @@ def get_registry_password(file_path, registry_url):
             }
 
     except Exception:
-        return {}
+        pass
 
     return {}
-
     
 def display_help():
     print("Usage: %s     " % (sys.argv[0] ))
@@ -711,30 +727,40 @@ def main():
             debug = 1
         elif o == "--i-am-deleting-all-repo":
             i_am_deleting_all_repo = True           
-            
-    if registry_url != None and username==None and password==None:
-        mydict={}
-        if registry_url!=None and Port!=None:
-            mydict=get_registry_password("~/.docker/config.json",registry_url+":"+Port)
-        elif registry_url:
-            mydict=get_registry_password("~/.docker/config.json",registry_url)
-        
-        if (mydict and mydict["username"] and mydict["password"]):
-            username=mydict["username"]
-            password=mydict["password"]
-
 
     if "https://" in registry_url:
         registry_url = registry_url.replace("https://", "")
         Port=443
 
-    # We capture the port in group 1, but we target the whole ':digits/' for replacement
+    # We capture the port from registry_url and cleanup registry_url to keep only the host
     pattern = r':(\d+)/$'
     match = re.search(pattern, registry_url)
     if match:
         Port = match.group(1)
         registry_url = registry_url.replace(match.group(0), "")
     
+
+    # Find the credentials in the ~/.docker/config.json file
+    if registry_url != None and username==None and password==None:
+        mydict={}
+        clean_url = registry_url
+        pattern = r'(/)$'
+        match = re.search(pattern, clean_url)
+        if match:
+          clean_url = clean_url.replace(match.group(0), "")
+        
+        if registry_url!=None and Port!=None:
+            mydict=get_registry_password("~/.docker/config.json",clean_url+":"+str(Port))
+        elif registry_url:
+            mydict=get_registry_password("~/.docker/config.json",clean_url)
+        if (mydict and mydict["username"] and mydict["password"]):
+            username=mydict["username"]
+            password=mydict["password"]
+
+
+
+
+
     if tag==None:
         tag="latest"
         
@@ -767,6 +793,7 @@ def main():
             
         # list catalog v2
         elif a == "list-catalog":
+            #print(f"list-catalog: registry_url={registry_url}, Port={Port}, username={username}, password={password}")
             if not all([registry_url, Port]):
                 print(f"Error: missing parameters list-catalog(registry_url={registry_url},Port={Port})")
                 sys.exit(2)
