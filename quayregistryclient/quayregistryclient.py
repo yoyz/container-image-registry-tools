@@ -136,18 +136,33 @@ def browseapi(registry_url,Port,token,apipath):
     
     
 def listcatalog(registry_url, username, password,Port):
+    images=None
     if checkhttpsconnection(registry_url,Port)==0:
         return(0)
+    
+    if username==None and password==None:
+        catalog_url = f"https://{registry_url}:{Port}/v2/_catalog"
+        response = requests.get(catalog_url)
+        if response.status_code == 200:
+            #printstderr("200 OK")
+            images=fetch_catalog_v2_token(registry_url,Port,None)            
+        else:
+            printstderr("Failed to get catalog")
+            return(0)
+    elif username!=None and password!=None:
+        token=getToken(registry_url, username, password,Port)
+        images=fetch_catalog_v2(registry_url, username, password,Port,token)
+    else:
+        printstderr("username and password are required for authentication")
+        printstderr("anonymous access is tried if no username and password are provided")
+        return(0)
 
-    catalog_url = f"{registry_url}:{Port}/v2/_catalog"
-    response = requests.get(catalog_url)
-    if response.status_code == 200:
-        printstderr("200 OK")
-
-    token=getToken(registry_url, username, password,Port)
-    images=fetch_catalog_v2(registry_url, username, password,Port,token)
+    if images==None:
+        printstderr("No images has been found")
+        return(0)
     for image in sorted(images["repositories"]):
         print(image)
+
 
 def listtags(registry_url, username, password,Port,imageName):
     if checkhttpsconnection(registry_url,Port)==0:
@@ -295,11 +310,19 @@ def fetch_catalog_v2(registry_url, username, password,Port,token):
 def fetch_catalog_v2_token(registry_url,Port,token):
     # Set the headers with authentication
     more_image=1
-    headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': "Bearer "+token
-    }    
+
+    if token!=None:
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': "Bearer "+token
+        }    
+    else:
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }    
+
     url_short="https://"+registry_url+":"+Port
     url=url_short+"/v2/_catalog"    
  
@@ -308,7 +331,11 @@ def fetch_catalog_v2_token(registry_url,Port,token):
     #print(headers)
     # Check if the response was successful
     if response.status_code == 200:
-        images = json.loads(response.text)
+        try:
+            images = json.loads(response.text)
+        except json.JSONDecodeError:
+            printstderr("Failed to parse JSON response")
+            exit(1)
         #print("headers: ",response.headers)
         #print(response.headers["Link"])
         while more_image:
