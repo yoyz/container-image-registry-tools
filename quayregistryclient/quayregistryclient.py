@@ -18,7 +18,6 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
-
 def printstderr(mystr):
     print(mystr, file=sys. stderr)
 
@@ -70,7 +69,7 @@ def checkhttpsconnection(registry_url, port):
     if ssl_already_verified==1:
         return ssl_already_verified
     try:
-        response = requests.get("https://"+registry_url+":"+port , timeout=5)
+        response = requests.get("https://"+registry_url+":"+str(port) , timeout=5)
         ssl_already_verified=1
         return(ssl_already_verified)
     except requests.exceptions.SSLError:
@@ -734,6 +733,11 @@ def main():
 
     # We capture the port from registry_url and cleanup registry_url to keep only the host
     pattern = r':(\d+)/$'
+    match = re.search(pattern, registry_url)
+    if match:
+        Port = match.group(1)
+        registry_url = registry_url.replace(match.group(0), "")
+    pattern = r':(\d+)$'
     match = re.search(pattern, registry_url)
     if match:
         Port = match.group(1)
