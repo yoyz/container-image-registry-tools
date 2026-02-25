@@ -645,6 +645,7 @@ def display_help():
     print("  get-server-certificate  : display the pem file of the server ")
     print("  browse-api              : query quay api and display the json ")
     print("  quay-api-discovery      : query the quay api endpoint /api/v1/discovery and output the json ")
+    print("  quay-api-listuser       : query the quay api endpoint /api/v1/superuser/users/ and output the json ")
     print("  list-catalog            : list all image in a repository querying /v2/_catalog")
     print("  list-tags               : list all tag for a given image <-i imagename> required ")
     print("  list-all                : list all image, tag and digest ")
@@ -775,9 +776,10 @@ def main():
 
         
     for a in args:
+        # Grab the PEM certificate or chain of certificates from the registry
         if a == "get-server-certificate":
             if not all([registry_url,Port]):
-                print("Error: missing parameters")
+                print(f"Error: missing parameters get-server-certificate(registry_url={registry_url},Port={Port})")
                 sys.exit(2)
             getservercertificate(registry_url, Port)
         # BROWSE API
@@ -794,7 +796,13 @@ def main():
                 print(f"Error: missing parameters browse-api(registry_url={registry_url},Port={Port},token={token},apipath={apipath})")
                 sys.exit(2)
             browseapi(registry_url,Port,token,apipath)
-            
+        # Query the quay api endpoint /api/v1/superuser/users/ and output the json    
+        elif a == "quay-api-listuser":
+            if not all([registry_url,Port,token]):
+                token="##maskingToken##" if token is not None else token
+                print(f"Error: missing parameters browse-api(registry_url={registry_url},Port={Port},token={token}")
+                sys.exit(2)
+            browseapi(registry_url,Port,token,"/api/v1/superuser/users/")
         # list catalog v2
         elif a == "list-catalog":
             #print(f"list-catalog: registry_url={registry_url}, Port={Port}, username={username}, password={password}")
