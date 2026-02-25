@@ -11,8 +11,9 @@ DEFAULT_PROTOCOL="https://"
 EXIT_TAG_NOT_FOUND=3
 ssl_already_verified=0
 debug=None
-VERSION = "0.2"
+VERSION = "0.3"
 
+# VERSION = "0.3" Adding quayapi stuff related to create delete changepassword of a user
 
 def signal_handler(sig, frame):
     sys.exit(0)
@@ -133,7 +134,78 @@ def browseapi(registry_url,Port,token,apipath):
     response = requests.get(url, headers=headers)
     print(response.text)
     
+
+def quayapi_delete_api_v1_superuser_users(registry_url,Port,token,username):
+    if debug:
+        printstderr("# quayapi_delete_api_v1_superuser_users")
+    if checkhttpsconnection(registry_url,Port)==0:
+        return(0)
+    apipath="/api/v1/superuser/users/"+username
+    #token=getToken(registry_url, username, password,Port)
+    #token2=getTokenForImageScope(registry_url, username, password,Port,imageName)
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Authorization': "Bearer "+token
+    }    
+    url_short="https://"+registry_url+":"+Port
+#    url=url_short+"/api/v1/repository/adminadmin/"+imageName+"/manifest"
+#    url=url_short+"/api/v1/user/"
+    url=url_short+apipath
+
+    if debug:
+        log_python_request_curl_transform("DELETE",url,headers)    
+    response = requests.delete(url, headers=headers)
+    print(response.text)
+
+def quayapi_post_api_v1_superuser_users(registry_url,Port,token,username):
+    if debug:
+        printstderr("# quayapi_delete_api_v1_superuser_users")
+    if checkhttpsconnection(registry_url,Port)==0:
+        return(0)
+    apipath="/api/v1/superuser/users/"
+    #token=getToken(registry_url, username, password,Port)
+    #token2=getTokenForImageScope(registry_url, username, password,Port,imageName)
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Authorization': "Bearer "+token
+    }    
+    payload = {"username": username}
+    url_short="https://"+registry_url+":"+Port
+#    url=url_short+"/api/v1/repository/adminadmin/"+imageName+"/manifest"
+#    url=url_short+"/api/v1/user/"
+    url=url_short+apipath
+
+    if debug:
+        log_python_request_curl_transform("POST",url,headers)    
+    response = requests.post(url, headers=headers, json=payload)
+    print(response.text)
+
+def quayapi_put_api_v1_superuser_users(registry_url,Port,token,username,password):
+    if debug:
+        printstderr("# quayapi_put_api_v1_superuser_users")
+    if checkhttpsconnection(registry_url,Port)==0:
+        return(0)
+    apipath="/api/v1/superuser/users/"+username
+    #token=getToken(registry_url, username, password,Port)
+    #token2=getTokenForImageScope(registry_url, username, password,Port,imageName)
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Authorization': "Bearer "+token
+    }    
+    payload = {"password": password}
+    url_short="https://"+registry_url+":"+Port
+    url=url_short+apipath
+
+    if debug:
+        log_python_request_curl_transform("PUT",url,headers)    
+    response = requests.put(url, headers=headers, json=payload)
+    print(response.text)
+
     
+
 def listcatalog(registry_url, username, password,Port):
     images=None
     if checkhttpsconnection(registry_url,Port)==0:
@@ -642,19 +714,25 @@ def display_help():
     print("Usage: %s     " % (sys.argv[0] ))
     print(f"Version: {VERSION}")
     print("Command       ")
-    print("  get-server-certificate  : display the pem file of the server ")
-    print("  browse-api              : query quay api and display the json ")
-    print("  quay-api-discovery      : query the quay api endpoint /api/v1/discovery and output the json ")
-    print("  quay-api-listuser       : query the quay api endpoint /api/v1/superuser/users/ and output the json ")
-    print("  list-catalog            : list all image in a repository querying /v2/_catalog")
-    print("  list-tags               : list all tag for a given image <-i imagename> required ")
-    print("  list-all                : list all image, tag and digest ")
-    print("  get-image-digest        : give the digest of an image <-i imagename> and <-t tag> required ")
-    print("  get-manifest            : fetch the manifest from an image <-i imagename> <-D digest> required ")
-    print("  get-blob                : fetch a blob associated with an image <-i imagename> <-D digest> required ")
-    print("  delete-repo             : delete a specific image repo <-i imagename> ")
-    print("  delete-all-repo         : delete a specific image repo <-i imagename> ")
-    print("  set-api-path-key-value  : set a specific key = value to an apipath  ")
+    print("  get-server-certificate           : display the pem file of the server ")
+    print("")
+    print("  browse-api                       : query quay api and display the json ")
+    print("  quay-api-discovery               : query the quay api endpoint /api/v1/discovery and output the json ")
+    print("    # SUPERUSER API with token required to be passed as <-T token> for authentication")
+    print("    quay-api-listuser                : query the quay api endpoint /api/v1/superuser/users/ and output the json ")
+    print("    quay-api-delete-user             : delete a user from the quay api endpoint /api/v1/superuser/users/ <-u username> ")
+    print("    quay-api-create-user             : create a user from the quay api endpoint /api/v1/superuser/users/ <-u username> ")
+    print("    quay-api-change-userpassword     : create a user from the quay api endpoint /api/v1/superuser/users/ <-u username> <-p password>")
+    print("")
+    print("  list-catalog                     : list all image in a repository querying /v2/_catalog")
+    print("  list-tags                        : list all tag for a given image <-i imagename> required ")
+    print("  list-all                         : list all image, tag and digest ")
+    print("  get-image-digest                 : give the digest of an image <-i imagename> and <-t tag> required ")
+    print("  get-manifest                     : fetch the manifest from an image <-i imagename> <-D digest> required ")
+    print("  get-blob                         : fetch a blob associated with an image <-i imagename> <-D digest> required ")
+    print("  delete-repo                      : delete a specific image repo <-i imagename> ")
+    print("  delete-all-repo                  : delete a specific image repo <-i imagename> ")
+    print("  set-api-path-key-value           : set a specific key = value to an apipath  ")
     print("Options            ")
     print("  <-r registry_url>")
     print("  <-u username>    ")
@@ -796,6 +874,7 @@ def main():
                 print(f"Error: missing parameters browse-api(registry_url={registry_url},Port={Port},token={token},apipath={apipath})")
                 sys.exit(2)
             browseapi(registry_url,Port,token,apipath)
+
         # Query the quay api endpoint /api/v1/superuser/users/ and output the json    
         elif a == "quay-api-listuser":
             if not all([registry_url,Port,token]):
@@ -803,6 +882,29 @@ def main():
                 print(f"Error: missing parameters browse-api(registry_url={registry_url},Port={Port},token={token}")
                 sys.exit(2)
             browseapi(registry_url,Port,token,"/api/v1/superuser/users/")
+
+        # 
+        elif a == "quay-api-delete-user":
+            if not all([registry_url,Port,token,username]):
+                token="##maskingToken##" if token is not None else token
+                print(f"Error: missing parameters quay-api-delete-user(registry_url={registry_url},Port={Port},token={token},username={username})")
+                sys.exit(2)
+            quayapi_delete_api_v1_superuser_users(registry_url,Port,token,username)
+
+        elif a == "quay-api-create-user":
+            if not all([registry_url,Port,token,username]):
+                token="##maskingToken##" if token is not None else token
+                print(f"Error: missing parameters quay-api-create-user(registry_url={registry_url},Port={Port},token={token},username={username})")
+                sys.exit(2)
+            quayapi_post_api_v1_superuser_users(registry_url,Port,token,username)
+
+        elif a == "quay-api-change-userpassword":
+            if not all([registry_url,Port,token,username,password]):
+                token="##maskingToken##" if token is not None else token
+                print(f"Error: missing parameters quay-api-change-userpassword(registry_url={registry_url},Port={Port},token={token},username={username},password={password})")
+                sys.exit(2)
+            quayapi_put_api_v1_superuser_users(registry_url,Port,token,username,password)
+
         # list catalog v2
         elif a == "list-catalog":
             #print(f"list-catalog: registry_url={registry_url}, Port={Port}, username={username}, password={password}")
