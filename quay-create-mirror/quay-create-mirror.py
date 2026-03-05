@@ -7,7 +7,7 @@ import time
 import ssl
 import socket
 
-__version__ = "0.15"
+__version__ = "0.18"
 
 class QuayClient:
     def __init__(self, url, token, debug=False):
@@ -103,7 +103,7 @@ def list_action(args):
         print(f"❌ Failed to list repositories: {e}")
         sys.exit(1)
 
-def robot_action(args):
+def create_robot_action(args):
     client = QuayClient(args.tgt_url, args.tgt_token, debug=args.debug)
     with open(args.file, 'r') as f:
         namespaces = {line.split('/')[0] for line in f if '/' in line}
@@ -129,6 +129,61 @@ def robot_action(args):
         
         time.sleep(0.5)
 
+def list_robot_action(args):
+    client = QuayClient(args.tgt_url, args.tgt_token, debug=args.debug)
+    with open(args.file, 'r') as f:
+        namespaces = {line.split('/')[0] for line in f if '/' in line}
+    
+    for ns in namespaces:
+        target_ns = f"{args.prefix}/{ns}" if args.prefix else ns
+        print(f"--> Listing robots for Org: {target_ns}")
+        try:
+            resp = client._request("GET", f"/api/v1/organization/{target_ns}/robots")
+            if resp.status_code == 200:
+                robots = resp.json().get('robots', [])
+                if not robots:
+                    print("    ℹ️  No robots found.")
+                for r in robots:
+                    print(f"    🤖 {r.get('name')}")
+            elif resp.status_code == 404:
+                print("    ℹ️  Org not found (404).")
+            else:
+                resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            print(f"    ❌ API Error: {e.response.status_code} - {e.response.text}")
+        except Exception as e:
+            print(f"    ❌ Failed: {e}")
+        
+        time.sleep(0.5)
+
+def delete_robot_action(args):
+    client = QuayClient(args.tgt_url, args.tgt_token, debug=args.debug)
+    confirm = input(f"⚠️  DANGER: Delete robot '{args.robot_name}' from organizations in {args.file}? (y/N): ")
+    if confirm.lower() != 'y':
+        print("Aborted.")
+        return
+
+    with open(args.file, 'r') as f:
+        namespaces = {line.split('/')[0] for line in f if '/' in line} # FIXED HERE
+    
+    for ns in namespaces:
+        target_ns = f"{args.prefix}/{ns}" if args.prefix else ns
+        print(f"🗑️  Deleting robot '{args.robot_name}' from: {target_ns}...")
+        try:
+            resp = client._request("DELETE", f"/api/v1/organization/{target_ns}/robots/{args.robot_name}")
+            if resp.status_code in [202, 204]:
+                print(f"    ✅ Deleted.")
+            elif resp.status_code == 404:
+                print(f"    ℹ️  Already deleted (404).")
+            else:
+                resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            print(f"    ❌ API Error: {e.response.status_code} - {e.response.text}")
+        except Exception as e:
+            print(f"    ❌ Failed: {e}")
+        
+        time.sleep(0.5)
+
 def sync_action(args):
     tgt_client = QuayClient(args.tgt_url, args.tgt_token, debug=args.debug)
     with open(args.file, 'r') as f:
@@ -139,11 +194,12 @@ def sync_action(args):
         target_ns = f"{args.prefix}/{src_ns}" if args.prefix else src_ns
         full_target_path = f"{target_ns}/{repo_name}"
         
-        print(f"--> Configuring Mirror: {full_target_path}")
+        local_sync_user = args.sync_user if args.sync_user else f"{target_ns}+{args.robot_name}"
+        
+        print(f"--> Configuring Mirror: {full_target_path} (Using user: {local_sync_user})")
         try:
             repo_desc = f"{args.src_url.rstrip('/')}/{path}"
 
-            # 1. Create Repo 
             repo_data = {
                 "repository": repo_name, 
                 "namespace": target_ns, 
@@ -156,7 +212,6 @@ def sync_action(args):
             else:
                 resp.raise_for_status()
 
-            # 2. Set state to MIRROR 
             put_data = {
                 "repo_state": "MIRROR",
                 "description": repo_desc
@@ -164,7 +219,6 @@ def sync_action(args):
             resp = tgt_client._request("PUT", f"/api/v1/repository/{full_target_path}", json=put_data)
             resp.raise_for_status()
 
-            # 3. Configure Mirror settings
             mirror_config = {
                 "is_enabled": True,
                 "external_reference": f"{args.src_url.replace('https://', '').replace('http://', '').strip('/')}/{path}",
@@ -173,7 +227,7 @@ def sync_action(args):
                 "sync_interval": args.interval,
                 "sync_start_date": "2024-01-01T00:00:00Z",
                 "root_rule": {"rule_kind": "tag_glob_csv", "rule_value": ["*"]},
-                "robot_username": f"{target_ns}+{args.robot_name}"
+                "robot_username": local_sync_user
             }
             
             if args.insecure:
@@ -421,12 +475,25 @@ if __name__ == "__main__":
         p_list.add_argument("--namespace", help="Optional: filter source namespace")
         p_list.add_argument("--file", default="repos.txt")
 
-        p_robot = subparsers.add_parser("robot", parents=[parent_parser])
-        p_robot.add_argument("--tgt-url", required=True)
-        p_robot.add_argument("--tgt-token", required=True)
-        p_robot.add_argument("--file", default="repos.txt")
-        p_robot.add_argument("--prefix", help="Target namespace prefix")
-        p_robot.add_argument("--robot-name", default="mirrorbot")
+        p_create_robot = subparsers.add_parser("create-robot", parents=[parent_parser])
+        p_create_robot.add_argument("--tgt-url", required=True)
+        p_create_robot.add_argument("--tgt-token", required=True)
+        p_create_robot.add_argument("--file", default="repos.txt")
+        p_create_robot.add_argument("--prefix", help="Target namespace prefix")
+        p_create_robot.add_argument("--robot-name", default="mirrorbot")
+
+        p_list_robot = subparsers.add_parser("list-robot", parents=[parent_parser])
+        p_list_robot.add_argument("--tgt-url", required=True)
+        p_list_robot.add_argument("--tgt-token", required=True)
+        p_list_robot.add_argument("--file", default="repos.txt")
+        p_list_robot.add_argument("--prefix", help="Target namespace prefix")
+
+        p_delete_robot = subparsers.add_parser("delete-robot", parents=[parent_parser])
+        p_delete_robot.add_argument("--tgt-url", required=True)
+        p_delete_robot.add_argument("--tgt-token", required=True)
+        p_delete_robot.add_argument("--file", default="repos.txt")
+        p_delete_robot.add_argument("--prefix", help="Target namespace prefix")
+        p_delete_robot.add_argument("--robot-name", default="mirrorbot")
 
         p_sync = subparsers.add_parser("sync", parents=[parent_parser])
         p_sync.add_argument("--src-url", required=True)
@@ -440,6 +507,7 @@ if __name__ == "__main__":
         p_sync.add_argument("--interval", type=int, default=86400)
         p_sync.add_argument("--visibility", default="private")
         p_sync.add_argument("--insecure", action="store_true", help="Disable TLS verification for the source registry")
+        p_sync.add_argument("--sync-user", help="Override robot creation: Exact user/robot to execute local sync (e.g. adminadmin)")
 
         p_sync_now = subparsers.add_parser("sync-now", parents=[parent_parser])
         p_sync_now.add_argument("--tgt-url", required=True)
@@ -469,7 +537,9 @@ if __name__ == "__main__":
         args = parser.parse_args()
         func_map = {
             "list": list_action, 
-            "robot": robot_action, 
+            "create-robot": create_robot_action, 
+            "list-robot": list_robot_action,
+            "delete-robot": delete_robot_action,
             "sync": sync_action, 
             "sync-now": sync_now_action,
             "cleanup": cleanup_action,
