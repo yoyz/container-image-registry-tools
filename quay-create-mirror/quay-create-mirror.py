@@ -7,7 +7,12 @@ import time
 import ssl
 import socket
 
-__version__ = "0.18"
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+__version__ = "0.24"
 
 class QuayClient:
     def __init__(self, url, token, debug=False):
@@ -19,7 +24,7 @@ class QuayClient:
         self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         self.debug = debug
 
-    def _request(self, method, path, max_retries=3, **kwargs):
+    def _request(self, method, path, max_retries=10, **kwargs):
         full_url = f"{self.url}{path}"
         
         if self.debug:
@@ -57,13 +62,17 @@ class QuayClient:
         namespaces = []
         if self.debug: print("[DEBUG] Fetching all superuser users & orgs to find namespaces...")
         
-        resp = self._request("GET", "/api/v1/superuser/users/")
-        if resp.status_code == 200:
-            namespaces.extend([u['username'] for u in resp.json().get('users', [])])
+        resp_users = self._request("GET", "/api/v1/superuser/users/")
+        if resp_users.status_code == 200:
+            namespaces.extend([u['username'] for u in resp_users.json().get('users', [])])
+        else:
+            print(f"    ⚠️  Failed to fetch users (HTTP {resp_users.status_code}). Check if token is valid and has superuser rights.")
             
-        resp = self._request("GET", "/api/v1/superuser/organizations/")
-        if resp.status_code == 200:
-            namespaces.extend([o['name'] for o in resp.json().get('organizations', [])])
+        resp_orgs = self._request("GET", "/api/v1/superuser/organizations/")
+        if resp_orgs.status_code == 200:
+            namespaces.extend([o['name'] for o in resp_orgs.json().get('organizations', [])])
+        else:
+            print(f"    ⚠️  Failed to fetch organizations (HTTP {resp_orgs.status_code}). Check if token is valid and has superuser rights.")
             
         return namespaces
 
@@ -72,7 +81,7 @@ class QuayClient:
         namespaces_to_check = [namespace] if namespace else self.get_all_namespaces()
         
         if not namespaces_to_check:
-            print("❌ No namespaces found to query. Please provide --namespace manually.")
+            print("❌ No namespaces found to query. Please provide --namespace manually or check your token permissions.")
             sys.exit(1)
             
         for ns in namespaces_to_check:
@@ -95,7 +104,17 @@ class QuayClient:
 def list_action(args):
     client = QuayClient(args.src_url, args.src_token, debug=args.debug)
     try:
+        if not args.all and not args.namespace:
+            print("❌ Please provide either --namespace <name> or --all to list repositories.")
+            sys.exit(1)
+            
+        print(f"--> Discovery Mode: Fetching repositories from {args.src_url}...")
         repos = client.get_all_repos(args.namespace)
+        
+        if not repos:
+            print("❌ No repositories found.")
+            sys.exit(1)
+            
         with open(args.file, 'w') as f:
             for r in repos: f.write(f"{r}\n")
         print(f"✅ Exported {len(repos)} repo paths to {args.file}")
@@ -126,8 +145,6 @@ def create_robot_action(args):
             print(f"    ❌ API Error: {e.response.status_code} - {e.response.text}")
         except Exception as e:
             print(f"    ❌ Failed: {e}")
-        
-        time.sleep(0.5)
 
 def list_robot_action(args):
     client = QuayClient(args.tgt_url, args.tgt_token, debug=args.debug)
@@ -153,8 +170,6 @@ def list_robot_action(args):
             print(f"    ❌ API Error: {e.response.status_code} - {e.response.text}")
         except Exception as e:
             print(f"    ❌ Failed: {e}")
-        
-        time.sleep(0.5)
 
 def delete_robot_action(args):
     client = QuayClient(args.tgt_url, args.tgt_token, debug=args.debug)
@@ -164,7 +179,7 @@ def delete_robot_action(args):
         return
 
     with open(args.file, 'r') as f:
-        namespaces = {line.split('/')[0] for line in f if '/' in line} # FIXED HERE
+        namespaces = {line.split('/')[0] for line in f if '/' in line}
     
     for ns in namespaces:
         target_ns = f"{args.prefix}/{ns}" if args.prefix else ns
@@ -181,8 +196,6 @@ def delete_robot_action(args):
             print(f"    ❌ API Error: {e.response.status_code} - {e.response.text}")
         except Exception as e:
             print(f"    ❌ Failed: {e}")
-        
-        time.sleep(0.5)
 
 def sync_action(args):
     tgt_client = QuayClient(args.tgt_url, args.tgt_token, debug=args.debug)
@@ -194,9 +207,9 @@ def sync_action(args):
         target_ns = f"{args.prefix}/{src_ns}" if args.prefix else src_ns
         full_target_path = f"{target_ns}/{repo_name}"
         
-        local_sync_user = args.sync_user if args.sync_user else f"{target_ns}+{args.robot_name}"
+        local_sync_user = f"{target_ns}+{args.robot_name}"
         
-        print(f"--> Configuring Mirror: {full_target_path} (Using user: {local_sync_user})")
+        print(f"--> Configuring Mirror: {full_target_path}")
         try:
             repo_desc = f"{args.src_url.rstrip('/')}/{path}"
 
@@ -222,8 +235,8 @@ def sync_action(args):
             mirror_config = {
                 "is_enabled": True,
                 "external_reference": f"{args.src_url.replace('https://', '').replace('http://', '').strip('/')}/{path}",
-                "external_registry_username": args.remote_user,
-                "external_registry_password": args.remote_pass,
+                "external_registry_username": args.src_user,
+                "external_registry_password": args.src_pass,
                 "sync_interval": args.interval,
                 "sync_start_date": "2024-01-01T00:00:00Z",
                 "root_rule": {"rule_kind": "tag_glob_csv", "rule_value": ["*"]},
@@ -248,8 +261,6 @@ def sync_action(args):
             print(f"    ❌ API Error: {e.response.status_code} - {e.response.text}")
         except Exception as e:
             print(f"    ❌ Failed: {e}")
-            
-        time.sleep(0.5)
 
 def sync_now_action(args):
     client = QuayClient(args.tgt_url, args.tgt_token, debug=args.debug)
@@ -294,8 +305,6 @@ def sync_now_action(args):
             print(f"    ❌ API Error: {e.response.status_code} - {e.response.text}")
         except Exception as e:
             print(f"    ❌ Failed: {e}")
-            
-        time.sleep(0.5)
 
 def cleanup_action(args):
     client = QuayClient(args.tgt_url, args.tgt_token, debug=args.debug)
@@ -324,7 +333,6 @@ def cleanup_action(args):
         except requests.exceptions.HTTPError as e:
             print(f"    ❌ API Error: {e.response.status_code} - {e.response.text}")
             
-        time.sleep(0.5)
 
 def status_action(args):
     client = QuayClient(args.tgt_url, args.tgt_token, debug=args.debug)
@@ -383,8 +391,6 @@ def status_action(args):
         except Exception as e:
             counts["OTHER"] += 1
             print(f"⚠️  {path}: FAILED TO QUERY ({e})")
-            
-        time.sleep(0.1) 
 
     print("\n--- Mirror Status Summary ---")
     for status, count in counts.items():
@@ -459,13 +465,56 @@ def get_cert_action(args):
         print(f"Details: {e}")
         sys.exit(1)
 
+
 if __name__ == "__main__":
     try:
         print(f"--- Quay Mirror Tool v{__version__} ---")
+        
+        argv = sys.argv[1:]
+        config_file = None
+        
+        if '-c' in argv:
+            config_file = argv[argv.index('-c') + 1]
+        elif '--config' in argv:
+            config_file = argv[argv.index('--config') + 1]
+
+        config_args = []
+        if config_file:
+            if yaml is None:
+                print("❌ Error: PyYAML is not installed. Please run 'pip install pyyaml' to use YAML config files.")
+                sys.exit(1)
+            try:
+                with open(config_file, 'r') as f:
+                    config_data = yaml.safe_load(f)
+                
+                if config_data:
+                    for k, v in config_data.items():
+                        key = k.replace('_', '-')
+                        if isinstance(v, bool):
+                            if v: config_args.append(f"--{key}")
+                        else:
+                            config_args.extend([f"--{key}", str(v)])
+            except Exception as e:
+                print(f"❌ Error reading config file {config_file}: {e}")
+                sys.exit(1)
+
+        commands = ['list', 'create-robot', 'list-robot', 'delete-robot', 'sync', 'sync-now', 'cleanup', 'status', 'get-cert']
+        cmd_index = -1
+        for i, arg in enumerate(argv):
+            if arg in commands:
+                cmd_index = i
+                break
+                
+        if cmd_index != -1 and config_args:
+            argv = argv[:cmd_index+1] + config_args + argv[cmd_index+1:]
+        elif config_args:
+            argv = config_args + argv
+
         parser = argparse.ArgumentParser(description=f"Quay Mirror Automation v{__version__}")
         
         parent_parser = argparse.ArgumentParser(add_help=False)
         parent_parser.add_argument("-d", "--debug", action="store_true", help="Print debug curl commands and raw responses")
+        parent_parser.add_argument("-c", "--config", help="Path to YAML configuration file")
 
         subparsers = parser.add_subparsers(dest="command")
 
@@ -473,6 +522,7 @@ if __name__ == "__main__":
         p_list.add_argument("--src-url", required=True)
         p_list.add_argument("--src-token", required=True)
         p_list.add_argument("--namespace", help="Optional: filter source namespace")
+        p_list.add_argument("--all", action="store_true", help="Fetch ALL repositories from the source")
         p_list.add_argument("--file", default="repos.txt")
 
         p_create_robot = subparsers.add_parser("create-robot", parents=[parent_parser])
@@ -501,13 +551,12 @@ if __name__ == "__main__":
         p_sync.add_argument("--tgt-token", required=True)
         p_sync.add_argument("--file", default="repos.txt")
         p_sync.add_argument("--prefix", help="Target namespace prefix")
-        p_sync.add_argument("--remote-user", required=True)
-        p_sync.add_argument("--remote-pass", required=True)
+        p_sync.add_argument("--src-user", required=True)
+        p_sync.add_argument("--src-pass", required=True)
         p_sync.add_argument("--robot-name", default="mirrorbot")
         p_sync.add_argument("--interval", type=int, default=86400)
         p_sync.add_argument("--visibility", default="private")
         p_sync.add_argument("--insecure", action="store_true", help="Disable TLS verification for the source registry")
-        p_sync.add_argument("--sync-user", help="Override robot creation: Exact user/robot to execute local sync (e.g. adminadmin)")
 
         p_sync_now = subparsers.add_parser("sync-now", parents=[parent_parser])
         p_sync_now.add_argument("--tgt-url", required=True)
@@ -534,7 +583,13 @@ if __name__ == "__main__":
         p_cert.add_argument("--url", required=True, help="Registry URL to fetch cert from")
         p_cert.add_argument("--out", help="Save output to this file")
 
-        args = parser.parse_args()
+        args, unknown = parser.parse_known_args(argv)
+        
+        if hasattr(args, 'command') and args.command and unknown:
+            ignored_flags = [flag for flag in unknown if flag.startswith('-')]
+            if ignored_flags:
+                print(f"    ℹ️  Ignored unused parameters from config for '{args.command}': {', '.join(ignored_flags)}\n")
+
         func_map = {
             "list": list_action, 
             "create-robot": create_robot_action, 
