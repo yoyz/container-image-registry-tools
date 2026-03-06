@@ -1,13 +1,14 @@
-### README.md
-
-```markdown
 # Quay Mirror Automation Tool
 
-A robust, idempotent, and fully automated Python utility for migrating and mirroring repositories across Red Hat Quay registries. 
+A mirroring tool for quay written in python.
+It target robustness, idempotent, and fully automated mirroring repositories across Red Hat disconnected Quay registries. 
 
-
-
-Whether you are synchronizing 10 repositories or 10,000, this tool handles discovery, organization creation, robot account provisioning, and TLS-bypassing mirror configurations. Built-in exponential backoff and idempotency mean you can safely run and re-run commands at high speeds without breaking existing configurations.
+Whether you are synchronizing 10 or hundred repositories, this tool handles : 
+* discovery
+* organization creation 
+* robot account provisioning 
+* TLS-bypassing mirror configurations usefull in bootcamp lab
+* Built-in exponential backoff and idempotency mean you can safely run and re-run commands at high speeds without breaking existing configurations.
 
 ## Features
 
@@ -26,11 +27,16 @@ Whether you are synchronizing 10 repositories or 10,000, this tool handles disco
 * `pyyaml` library (`pip3 install pyyaml`)
 * API Tokens for your Source and Target Quay registries (Superuser tokens required for full organization discovery and creation).
 
+It has been tested using the standard python library on Fedora Core 42 and Centos Stream 10.
+
 ---
 
 ## Configuration
 
-Create a `config.yaml` file in the same directory as the script. The script will automatically parse these values and feed them into the commands. Any variables not needed by a specific command will be safely ignored.
+Create a `config.yaml` file in the same directory as the script.
+This 'config.yaml file is not mandatory but it allow to omit parameter in the command line if it exist.
+The script will automatically parse these values and feed them into the command line of the script. 
+Any variables not needed by a specific command will be safely ignored and shown in the first line of output of the script.
 
 ```yaml
 src-url: "[https://source-quay.example.com](https://source-quay.example.com)"
@@ -60,6 +66,24 @@ Scans the source Quay registry and exports all accessible repositories into a te
 python3 quay-create-mirror.py list -c config.yaml --all
 
 ```
+
+The output produced in the repos.txt will be 
+
+
+```bash
+head repos.txt 
+openshift/graph-image
+openshift/release
+openshift/release-images
+openshift4/ose-csi-external-attacher-rhel9
+openshift4/topology-aware-lifecycle-manager-rhel9-operator
+openshift4/topology-aware-lifecycle-manager-recovery-rhel9
+openshift4/topology-aware-lifecycle-manager-precache-rhel9
+openshift4/topology-aware-lifecycle-manager-aztp-rhel9
+openshift4/ose-kube-rbac-proxy-rhel9
+openshift4/ose-cluster-api-rhel9
+```
+
 
 ### 2. Robot Management (`create-robot`, `list-robot`, `delete-robot`)
 
@@ -116,6 +140,7 @@ python3 quay-create-mirror.py status -c config.yaml --all
 ### 5. `sync-now` - Force Immediate Synchronization
 
 Bypass the standard retry interval and force the Quay backend workers to sync immediately.
+It could be useful if the repository has not yet started the mirroring.
 
 **Pro-tip:** Use the `--failed-only` flag to selectively retry only the repositories currently in an `ERROR` or `FAIL` state.
 
