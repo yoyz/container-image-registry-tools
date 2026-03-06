@@ -39,9 +39,9 @@ The script will automatically parse these values and feed them into the command 
 Any variables not needed by a specific command will be safely ignored and shown in the first line of output of the script.
 
 ```yaml
-src-url: "[https://source-quay.example.com](https://source-quay.example.com)"
+src-url: "https://source-quay.example.com"
 src-token: "YOUR_SOURCE_SUPERUSER_TOKEN"
-tgt-url: "[https://target-quay.example.com](https://target-quay.example.com)"
+tgt-url: "https://target-quay.example.com"
 tgt-token: "YOUR_TARGET_SUPERUSER_TOKEN"
 src-user: "adminadmin"
 src-pass: "adminadmin"
