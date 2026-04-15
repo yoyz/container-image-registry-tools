@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# vim: set tabstop=4 shiftwidth=4 expandtab:
 # ==============================================================================
 # quayspaceconsumption.py
 # ------------------------------------------------------------------------------
@@ -16,13 +17,16 @@
 # it has only been tested on on premise quay3
 # it should not harm your quay because it only do GET/HEAD action
 
-from urllib.parse import quote_plus, unquote
+from urllib.parse import quote_plus, unquote, urlparse
 from collections import defaultdict
 import requests, json, getopt, sys, re, signal, os, base64, csv
 import urllib3
 
 # Suppress SSL Warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Global Session for connection pooling (massive speed boost)
+SESSION = requests.Session()
 
 # Global Configuration
 CONFIG = {
@@ -33,7 +37,8 @@ CONFIG = {
     "DEBUG": False,
     "CURL": False,
     "REPO_FILE": "",
-    "OUTPUT_CSV": ""
+    "OUTPUT_CSV": "",
+    "PREFIX": ""
 }
 
 # Global Trackers
@@ -143,7 +148,7 @@ def get_registry_auth(file_path, registry_host):
                 if ":" in decoded_auth:
                     username, password = decoded_auth.split(":", 1)
                     return {"username": username, "password": password}
-            except Exception: pass
+            except Exception as e: debug(f"[DEBUG] Suppressed Exception: {e}")
 
         # Handle explicit keys
         if "username" in reg_data and "password" in reg_data:
@@ -164,27 +169,36 @@ def fetch_manifest_data(url, headers, depth, label):
     # 1. Try Complex (Multi-Arch)
     print_curl(url, headers, depth, f"{label} (Complex)")
     try:
-        resp = requests.get(url, headers=headers, verify=False)
-        if resp.status_code == 200: return resp.json()
-    except Exception: pass
+        resp = SESSION.get(url, headers=headers, verify=False)
+        if resp.status_code == 200: 
+            return resp.json()
+    except requests.exceptions.RequestException as e:
+            debug(f"[DEBUG] Suppressed Exception: {e}")
+    except json.JSONDecodeError:
+            debug(f"{indent}[ERROR] Invalid JSON response from {url}")
+
 
     # 2. Try Simple V2
     simple_headers = headers.copy()
     simple_headers["Accept"] = "application/vnd.docker.distribution.manifest.v2+json"
     print_curl(url, simple_headers, depth, f"{label} (Simple)")
     try:
-        resp = requests.get(url, headers=simple_headers, verify=False)
+        resp = SESSION.get(url, headers=simple_headers, verify=False)
         if resp.status_code == 200: return resp.json()
-    except Exception: pass
+    except Exception as e: 
+        debug(f"[DEBUG] Suppressed Exception: {e}")
+    except json.JSONDecodeError:
+        debug(f"{indent}[ERROR] Invalid JSON response from {url}")
+
 
     # 3. Try Any
     any_headers = headers.copy()
     any_headers["Accept"] = "*/*"
     print_curl(url, any_headers, depth, f"{label} (Any)")
     try:
-        resp = requests.get(url, headers=any_headers, verify=False)
+        resp = SESSION.get(url, headers=any_headers, verify=False)
         if resp.status_code == 200: return resp.json()
-    except Exception: pass
+    except Exception as e: debug(f"[DEBUG] Suppressed Exception: {e}")
     
     return None
 
@@ -212,7 +226,7 @@ def recurse_manifest(ns, repo_decoded, digest_or_tag, current_token, use_v2_api,
         url = f"{CONFIG['URL']}/api/v1/repository/{ns}/{repo_enc}/manifest/{digest_or_tag}"
         print_curl(url, headers, depth, "V1")
         try:
-            resp = requests.get(url, headers=headers, verify=False)
+            resp = SESSION.get(url, headers=headers, verify=False)
             if resp.status_code == 200 and "error" not in resp.json():
                 body = resp.json()
             else:
@@ -237,7 +251,7 @@ def recurse_manifest(ns, repo_decoded, digest_or_tag, current_token, use_v2_api,
         manifests = body.get("manifests", [])
         if not manifests and "manifest_data" in body:
             try: manifests = json.loads(body["manifest_data"]).get("manifests", [])
-            except Exception: pass
+            except Exception as e: debug(f"[DEBUG] Suppressed Exception: {e}")
 
         if manifests:
             for m in manifests:
@@ -253,7 +267,7 @@ def recurse_manifest(ns, repo_decoded, digest_or_tag, current_token, use_v2_api,
         layers = body.get("layers", [])
         if not layers and "manifest_data" in body:
             try: layers = json.loads(body["manifest_data"]).get("layers", [])
-            except Exception: pass
+            except Exception as e: debug(f"[DEBUG] Suppressed Exception: {e}")
 
         for layer in layers:
             b_hash = layer.get("blob_digest") or layer.get("digest") or layer.get("hash")
@@ -281,13 +295,13 @@ def discover_api_v1_repos(base_url, token):
     debug("[INFO] Discovering repositories via API v1...")
     discovered_repos = []
     try:
-        resp = requests.get(f"{base_url}/api/v1/user/", headers={"Authorization": f"Bearer {token}"}, verify=False)
+        resp = SESSION.get(f"{base_url}/api/v1/user/", headers={"Authorization": f"Bearer {token}"}, verify=False)
         data = resp.json()
         orgs = [o['name'] for o in data.get('organizations', [])]
         if 'username' in data: orgs.append(data['username'])
 
         for org in orgs:
-            r_resp = requests.get(f"{base_url}/api/v1/repository", params={'namespace': org}, headers={"Authorization": f"Bearer {token}"}, verify=False)
+            r_resp = SESSION.get(f"{base_url}/api/v1/repository", params={'namespace': org}, headers={"Authorization": f"Bearer {token}"}, verify=False)
             if r_resp.status_code == 200:
                 repos = r_resp.json().get('repositories', [])
                 for r in repos:
@@ -320,7 +334,7 @@ def process_api_v1_repos(repos_list, base_url, token):
         while has_additional:
             try:
                 url = f"{base_url}/api/v1/repository/{ns}/{repo_enc}/tag/?limit=100&page={page}"
-                resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, verify=False)
+                resp = SESSION.get(url, headers={"Authorization": f"Bearer {token}"}, verify=False)
                 
                 if resp.status_code == 200:
                     data = resp.json()
@@ -348,7 +362,7 @@ def process_api_v1_repos(repos_list, base_url, token):
 
 def get_service_name(base_url):
     try:
-        resp = requests.get(f"{base_url}/v2/", verify=False, timeout=10)
+        resp = SESSION.get(f"{base_url}/v2/", verify=False, timeout=10)
         auth_header = resp.headers.get("Www-Authenticate", "")
         m = re.search(r'service="([^"]+)"', auth_header)
         if m: return m.group(1)
@@ -363,16 +377,16 @@ def discover_v2_catalog(base_url, user, password, service_name):
     cat_token = ""
     try:
         params = {'service': service_name}
-        auth_resp = requests.get(f"{base_url}/v2/auth", auth=(user, password), params=params, verify=False)
+        auth_resp = SESSION.get(f"{base_url}/v2/auth", auth=(user, password), params=params, verify=False)
         if auth_resp.status_code == 200:
             cat_token = auth_resp.json().get('token') or auth_resp.json().get('access_token')
-    except Exception: pass
+    except Exception as e: debug(f"[DEBUG] Suppressed Exception: {e}")
 
     if cat_token:
         next_url = f"{base_url}/v2/_catalog?n=1000"
         while next_url:
             try:
-                cat_resp = requests.get(next_url, headers={"Authorization": f"Bearer {cat_token}"}, verify=False)
+                cat_resp = SESSION.get(next_url, headers={"Authorization": f"Bearer {cat_token}"}, verify=False)
                 if cat_resp.status_code == 200:
                     page_repos = cat_resp.json().get("repositories", [])
                     discovered_repos.extend(page_repos)
@@ -392,13 +406,13 @@ def discover_v2_catalog(base_url, user, password, service_name):
         debug("[INFO] Catalog empty/blocked. Using Search fallback...")
         try:
             params = {'query': ''} 
-            resp = requests.get(f"{base_url}/api/v1/find/repositories", auth=(user, password), params=params, verify=False)
+            resp = SESSION.get(f"{base_url}/api/v1/find/repositories", auth=(user, password), params=params, verify=False)
             if resp.status_code == 200:
                 results = resp.json().get('results', []) or resp.json().get('repositories', [])
                 for r in results:
                     name = r.get('full_name') or f"{r.get('namespace', {}).get('name')}/{r.get('name')}"
                     if name and '/' in name: discovered_repos.append(name)
-        except Exception: pass
+        except Exception as e: debug(f"[DEBUG] Suppressed Exception: {e}")
     
     discovered_repos.sort()
     return discovered_repos
@@ -417,7 +431,7 @@ def process_v2_repos(repos_list, base_url, user, password, service_name):
         repo_token = ""
         try:
             params = {'service': service_name, 'scope': scope}
-            r = requests.get(f"{base_url}/v2/auth", auth=(user, password), params=params, verify=False)
+            r = SESSION.get(f"{base_url}/v2/auth", auth=(user, password), params=params, verify=False)
             if r.status_code == 200:
                 repo_token = r.json().get('token') or r.json().get('access_token')
             else:
@@ -432,7 +446,7 @@ def process_v2_repos(repos_list, base_url, user, password, service_name):
 
         while next_tag_url:
             try:
-                r = requests.get(next_tag_url, headers={"Authorization": f"Bearer {repo_token}"}, verify=False)
+                r = SESSION.get(next_tag_url, headers={"Authorization": f"Bearer {repo_token}"}, verify=False)
                 if r.status_code == 200:
                     data = r.json()
                     tags = data.get('tags', []) or []
@@ -443,7 +457,7 @@ def process_v2_repos(repos_list, base_url, user, password, service_name):
                             "Authorization": f"Bearer {repo_token}", 
                             "Accept": "application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json"
                         }
-                        h = requests.head(f"{base_url}/v2/{full_repo}/manifests/{tag}", headers=h_headers, verify=False)
+                        h = SESSION.head(f"{base_url}/v2/{full_repo}/manifests/{tag}", headers=h_headers, verify=False)
                         digest = h.headers.get("Docker-Content-Digest")
                         
                         if digest:
@@ -505,8 +519,15 @@ def main():
         print(f"Try 'python3 {os.path.basename(sys.argv[0])} --help' for more information.")
         sys.exit(1)
         
-    if not CONFIG["URL"].startswith("http"):
-        CONFIG["URL"] = "https://" + CONFIG["URL"]
+    raw_url = CONFIG["URL"]
+    if not raw_url.startswith("http"):
+        raw_url = "https://" + raw_url
+        
+    # Split the base URL from the target namespace/repo
+    parsed = urlparse(raw_url)
+    CONFIG["URL"] = f"{parsed.scheme}://{parsed.netloc}"
+    CONFIG["PREFIX"] = parsed.path.strip('/')
+
 
     # --- AUTO-AUTH LOGIC ---
     if not CONFIG["TOKEN"] and (not CONFIG["USER"] or not CONFIG["PASS"]):
@@ -541,21 +562,34 @@ def main():
             sys.exit(1)
 
     # 2. EXECUTE MODE
+    # 2. EXECUTE MODE
     if CONFIG["TOKEN"]:
         if not repos_to_scan:
             repos_to_scan = discover_api_v1_repos(CONFIG["URL"], CONFIG["TOKEN"])
-        process_api_v1_repos(repos_to_scan, CONFIG["URL"], CONFIG["TOKEN"])
         
     elif CONFIG["USER"] and CONFIG["PASS"]:
         service_name = get_service_name(CONFIG["URL"])
         debug(f"[DEBUG] Detected Service Name: {service_name}")
         if not repos_to_scan:
             repos_to_scan = discover_v2_catalog(CONFIG["URL"], CONFIG["USER"], CONFIG["PASS"], service_name)
-        process_v2_repos(repos_to_scan, CONFIG["URL"], CONFIG["USER"], CONFIG["PASS"], service_name)
-        
     else:
         print("Error: No authentication provided (Token or User/Pass) and no credentials found in ~/.docker/config.json")
         sys.exit(1)
+
+    # --- NEW PREFIX FILTERING LOGIC ---
+    if CONFIG["PREFIX"] and not CONFIG["REPO_FILE"]:
+        debug(f"[INFO] Filtering repositories by prefix: '{CONFIG['PREFIX']}'")
+        repos_to_scan = [r for r in repos_to_scan if r.startswith(CONFIG["PREFIX"])]
+        if not repos_to_scan:
+            print(f"[!] No repositories found matching prefix '{CONFIG['PREFIX']}'. Exiting.")
+            sys.exit(0)
+
+    # --- TRIGGER THE PROCESSING ---
+    if CONFIG["TOKEN"]:
+        process_api_v1_repos(repos_to_scan, CONFIG["URL"], CONFIG["TOKEN"])
+    elif CONFIG["USER"] and CONFIG["PASS"]:
+        process_v2_repos(repos_to_scan, CONFIG["URL"], CONFIG["USER"], CONFIG["PASS"], service_name)
+
 
     # 3. REPORTING
     print("\nARCHITECTURE BREAKDOWN (Deduplicated within Arch)")
