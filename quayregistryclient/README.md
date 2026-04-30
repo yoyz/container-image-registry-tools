@@ -1,6 +1,6 @@
 # Registry List Tool
 
-`quayregistryclient.py` is a Python-based CLI utility for inspecting, managing, and deleting container image registries. 
+`quayregistryclient` is a Python-based CLI utility for inspecting, managing, and deleting container image registries. 
 It supports both the standard **Docker Registry HTTP API V2** and specific **Red Hat Quay API** endpoints.
 
 It is designed for administrators who need to debug registry issues, inspect manifests/blobs, or perform bulk deletion of repositories.
@@ -32,7 +32,7 @@ pip install requests
 The script uses a `COMMAND [OPTIONS]` structure.
 
 ```bash
-./quayregistryclient.py <COMMAND> [OPTIONS]
+./quayregistryclient <COMMAND> [OPTIONS]
 
 ```
 
