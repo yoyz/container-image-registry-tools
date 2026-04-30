@@ -21,6 +21,7 @@ def signal_handler(sig, frame):
 
 def printstderr(mystr):
     print(mystr, file=sys. stderr)
+    
 
 def getservercertificate(registry_url, Port):
     try:
@@ -555,6 +556,15 @@ def get_manifest_list_image_digest(registry_url, username, password,Port,token,i
             found=1
         manifestReturned=manifestReturned+" "+response.headers['Content-Type']                   
     
+    if found == 0:
+        status_code = response.status_code if response is not None else "N/A"
+        headers = response.headers if response is not None else {}
+        printstderr(
+            "Failed to get digest: status_code=%s headers=%s content_types_seen=%s"
+            % (status_code, headers, manifestReturned.strip())
+        )
+    return manifestListDigest
+
     if (found == 0):
         print("Failed to get images, status_code: %d header: %s, manifestReturned: %s" % ( response.status_code, response.header, manifestReturned))
     return(manifestListDigest)
@@ -724,15 +734,17 @@ def display_help():
     print("    quay-api-create-user             : create a user from the quay api endpoint /api/v1/superuser/users/ <-u username> ")
     print("    quay-api-change-userpassword     : create a user from the quay api endpoint /api/v1/superuser/users/ <-u username> <-p password>")
     print("")
-    print("  list-catalog                     : list all image in a repository querying /v2/_catalog")
-    print("  list-tags                        : list all tag for a given image <-i imagename> required ")
-    print("  list-all                         : list all image, tag and digest ")
-    print("  get-image-digest                 : give the digest of an image <-i imagename> and <-t tag> required ")
-    print("  get-manifest                     : fetch the manifest from an image <-i imagename> <-D digest> required ")
-    print("  get-blob                         : fetch a blob associated with an image <-i imagename> <-D digest> required ")
-    print("  delete-repo                      : delete a specific image repo <-i imagename> ")
-    print("  delete-all-repo                  : delete a specific image repo <-i imagename> ")
-    print("  set-api-path-key-value           : set a specific key = value to an apipath  ")
+    print("  list-catalog                    : list all image in a repository querying /v2/_catalog")
+    print("  list-tags                       : list all tag for a given image <-i imagename> required ")
+    print("  list-all                        : list all image, tag and digest ")
+    print("  get-image-manifest              : fetch manifest JSON for an image <-i imagename> <-D digest> required")
+    print("  get-image-digest                : give the digest of an image <-i imagename> and <-t tag> required ")
+    print("  get-manifest                    : fetch the manifest from an image <-i imagename> <-D digest> required ")
+    print("  get-blob                        : fetch a blob for an image <-i imagename> <-D digest> required")
+    print("  delete-repo                     : delete one repository <-i imagename> required")
+    print("  delete-tag                      : delete one tag <-i imagename> <-t tag> required")
+    print("  delete-all-repo                 : delete all repositories (requires --i-am-deleting-all-repo)")
+    print("  set-api-key-value               : set one key=value on an API path <-a apipath> <-K key> <-V value> required")
     print("Options            ")
     print("  <-r registry_url>")
     print("  <-u username>    ")
@@ -806,21 +818,21 @@ def main():
         elif o == "--i-am-deleting-all-repo":
             i_am_deleting_all_repo = True           
 
-    if "https://" in registry_url:
-        registry_url = registry_url.replace("https://", "")
-        Port=443
-
-    # We capture the port from registry_url and cleanup registry_url to keep only the host
-    pattern = r':(\d+)/$'
-    match = re.search(pattern, registry_url)
-    if match:
-        Port = match.group(1)
-        registry_url = registry_url.replace(match.group(0), "")
-    pattern = r':(\d+)$'
-    match = re.search(pattern, registry_url)
-    if match:
-        Port = match.group(1)
-        registry_url = registry_url.replace(match.group(0), "")
+    if registry_url:
+        if "https://" in registry_url:
+            registry_url = registry_url.replace("https://", "")
+            Port=443
+        # We capture the port from registry_url and cleanup registry_url to keep only the host
+        pattern = r':(\d+)/$'
+        match = re.search(pattern, registry_url)
+        if match:
+            Port = match.group(1)
+            registry_url = registry_url.replace(match.group(0), "")
+        pattern = r':(\d+)$'
+        match = re.search(pattern, registry_url)
+        if match:
+            Port = match.group(1)
+            registry_url = registry_url.replace(match.group(0), "")
     
 
     # Find the credentials in the ~/.docker/config.json file
