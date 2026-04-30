@@ -1225,6 +1225,10 @@ class QueryLoop:
         self.root = None
         self.visible_nodes = []
         self.selected_idx = 0
+        self.search_term = ""
+        self.search_active = False
+        self.search_matches = []
+        self.current_match = 0
 
     def authenticate(self):
         if not self.username or not self.password:
@@ -1306,6 +1310,97 @@ class QueryLoop:
             return dt.strftime("%Y-%m-%d")
         except:
             return date_str[:10] if date_str else "?"
+
+    def search_nodes(self, term):
+        if not term:
+            self.search_matches = []
+            return
+        self.search_matches = []
+        for i, (node, depth) in enumerate(self.visible_nodes):
+            if self._node_matches_term(node, term):
+                self.search_matches.append(i)
+        self.current_match = 0
+
+    def _node_matches_term(self, node, term):
+        search_name = node.name.lower()
+        if term.lower() in search_name:
+            return True
+        if node.node_type == "image" and node.data and "repo" in node.data:
+            if term.lower() in node.data["repo"].lower():
+                return True
+        return False
+
+    def _expand_matching_paths(self, node, term):
+        if node.node_type in ("directory", "registry"):
+            if not node.expanded:
+                node.expanded = True
+                self.load_node_children(node)
+            for child in node.children:
+                if self._expand_matching_paths(child, term):
+                    return True
+            return False
+        elif node.node_type == "image":
+            return self._node_matches_term(node, term)
+        return False
+
+    def _expand_only_matching_paths(self, term):
+        repos = self.fetch_catalog()
+        if not repos:
+            return
+        term_lower = term.lower()
+        matching_repos = [r for r in repos if term_lower in r.lower()]
+        for repo in matching_repos:
+            parts = repo.split('/')
+            current = self.root
+            for part in parts:
+                if not current.expanded:
+                    current.expanded = True
+                    self.load_node_children(current)
+                found = False
+                for child in current.children:
+                    if child.node_type == "directory" and part + "/" == child.name:
+                        current = child
+                        found = True
+                        break
+                    elif child.node_type == "image" and (part == child.name or part == child.data.get("repo", "")):
+                        found = True
+                        break
+                if not found:
+                    break
+
+    def get_search_input(self, stdscr):
+        h, w = stdscr.getmaxyx()
+        input_str = ""
+        cursor_pos = 0
+        while True:
+            stdscr.addstr(h - 2, 0, " " * (w - 1))
+            stdscr.addstr(h - 2, 0, f"Search: {input_str}_")
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key == ord('\n') or key == ord('\r'):
+                break
+            elif key in (ord('\x7f'), 127, curses.KEY_BACKSPACE, 8):
+                if cursor_pos > 0:
+                    input_str = input_str[:cursor_pos - 1] + input_str[cursor_pos:]
+                    cursor_pos -= 1
+            elif key == 27:
+                return ""
+            elif 32 <= key <= 126:
+                if cursor_pos < 40:
+                    input_str = input_str[:cursor_pos] + chr(key) + input_str[cursor_pos:]
+                    cursor_pos += 1
+        return input_str
+
+    def search_all_repos(self, term):
+        if not term:
+            self.search_matches = []
+            return
+        visible = self.get_visible_nodes()
+        self.search_matches = []
+        for i, (node, depth) in enumerate(visible):
+            if term.lower() in node.name.lower():
+                self.search_matches.append(i)
+        self.current_match = 0
 
     def calculate_image_size(self, repo_name):
         if not self.token:
@@ -1534,7 +1629,7 @@ class QueryLoop:
             stdscr.clear()
             h, w = stdscr.getmaxyx()
 
-            title = f"Registry Browser - {self.registry_url}:{self.port}"
+            title = f"Registry Browser - {self.registry_url}:{self.port} (Port: {self.port})"
             stdscr.addstr(0, (w - len(title)) // 2, title, curses.A_BOLD | curses.color_pair(1))
             stdscr.addstr(1, 0, "=" * (w - 1))
 
@@ -1580,10 +1675,16 @@ class QueryLoop:
                         icon = "[M]"
                     elif node.node_type == "registry":
                         icon = "[R]"
+                        port = node.data.get("port", self.port)
+                        node.name = f"{self.registry_url}:{port}"
 
                     display = f"{prefix}{icon} {node.name}"
+                    is_match = i in self.search_matches
                     if i == self.selected_idx:
-                        stdscr.addstr(y, 2, display[:w-3], curses.A_REVERSE)
+                        stdscr.addstr(y, 2, display[:w-3], curses.A_REVERSE | curses.A_BOLD)
+                    elif is_match:
+                        color = curses.color_pair(2)
+                        stdscr.addstr(y, 2, display[:w-3], color | curses.A_BOLD)
                     else:
                         color = curses.color_pair(1) if node.node_type == "directory" else \
                                 curses.color_pair(2) if node.node_type == "image" else \
@@ -1593,10 +1694,36 @@ class QueryLoop:
                                 curses.color_pair(3)
                         stdscr.addstr(y, 2, display[:w-3], color)
 
-            status = "[Space] Expand/Collapse | [Enter] View Details | [q] Quit"
+            match_info = f" [{self.current_match + 1}/{len(self.search_matches)}]" if self.search_matches else ""
+            status = f"[/] Search | [n/N] Next/Prev | [Space] Expand | [Enter] Details | [q] Quit{match_info}"
             stdscr.addstr(h - 1, 0, status[:w - 1])
 
             key = stdscr.getch()
+
+            if key == ord('/'):
+                term = self.get_search_input(stdscr)
+                if term:
+                    self.search_term = term
+                    self._expand_only_matching_paths(term)
+                    visible = self.get_visible_nodes()
+                    self.search_matches = []
+                    for i, (n, d) in enumerate(visible):
+                        if self._node_matches_term(n, term):
+                            self.search_matches.append(i)
+                    self.current_match = 0
+                    if self.search_matches:
+                        self.selected_idx = self.search_matches[0]
+                continue
+            elif key == ord('n') and self.search_matches:
+                if self.current_match < len(self.search_matches) - 1:
+                    self.current_match += 1
+                    self.selected_idx = self.search_matches[self.current_match]
+                continue
+            elif key == ord('N') and self.search_matches:
+                if self.current_match > 0:
+                    self.current_match -= 1
+                    self.selected_idx = self.search_matches[self.current_match]
+                continue
 
             if key == ord('q'):
                 break
