@@ -1190,13 +1190,499 @@ def create_parser():
     sp_cert.add_argument('-P', '--port', default='443')
     sp_cert.add_argument('-d', '--debug', action='store_true')
 
+    sp_interactive = subparsers.add_parser('interactive', help='Launch interactive ncurses interface', add_help=False)
+    sp_interactive.add_argument('-r', '--registry-url', required=True)
+    sp_interactive.add_argument('-P', '--port', default='443')
+    sp_interactive.add_argument('-u', '--username')
+    sp_interactive.add_argument('-p', '--password')
+    sp_interactive.add_argument('-d', '--debug', action='store_true')
+
     return parser
 
+import curses
+import json
 
 
-    
-    
-        
+class TreeNode:
+    def __init__(self, name, node_type, parent=None, data=None):
+        self.name = name
+        self.node_type = node_type
+        self.parent = parent
+        self.data = data
+        self.children = []
+        self.expanded = False
+        self.loaded = False
+
+
+class QueryLoop:
+    def __init__(self, registry_url, port, username, password, debug=False):
+        self.registry_url = registry_url
+        self.port = port
+        self.username = username
+        self.password = password
+        self.debug = debug
+        self.token = None
+        self.root = None
+        self.visible_nodes = []
+        self.selected_idx = 0
+
+    def authenticate(self):
+        if not self.username or not self.password:
+            return False
+        try:
+            self.token = getToken(self.registry_url, self.username, self.password, self.port)
+            return True
+        except Exception:
+            return False
+
+    def fetch_catalog(self):
+        if not self.token:
+            if not self.authenticate():
+                return []
+        try:
+            images = fetch_catalog_v2(self.registry_url, self.username, self.password, self.port, self.token)
+            if images and "repositories" in images:
+                return sorted(images["repositories"])
+            return []
+        except Exception:
+            return []
+
+    def fetch_tags(self, repo_name):
+        if not self.token:
+            if not self.authenticate():
+                return []
+        try:
+            token2 = getTokenForImageScope(self.registry_url, self.username, self.password, self.port, repo_name)
+            tags_data = get_tag_image(self.registry_url, self.username, self.password, self.port, token2, repo_name)
+            if tags_data and "tags" in tags_data:
+                return tags_data["tags"]
+            return []
+        except Exception:
+            return []
+
+    def fetch_digest(self, repo_name, tag):
+        if not self.token:
+            return None
+        try:
+            token2 = getTokenForImageScope(self.registry_url, self.username, self.password, self.port, repo_name)
+            digest = get_manifest_list_image_digest(self.registry_url, self.username, self.password, self.port, token2, repo_name, tag)
+            return digest
+        except Exception:
+            return None
+
+    def fetch_image_info(self, repo_name):
+        if not self.token:
+            if not self.authenticate():
+                return None
+        try:
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': "Bearer " + self.token
+            }
+            url = f"https://{self.registry_url}:{self.port}/api/v1/repository/{repo_name}"
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception:
+            return None
+
+    def format_size(self, size_bytes):
+        if size_bytes is None:
+            return "?"
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size_bytes < 1024:
+                return f"{size_bytes:.1f}{unit}"
+            size_bytes /= 1024
+        return f"{size_bytes:.1f}PB"
+
+    def format_date(self, date_str):
+        if not date_str:
+            return "?"
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            return dt.strftime("%Y-%m-%d")
+        except:
+            return date_str[:10] if date_str else "?"
+
+    def calculate_image_size(self, repo_name):
+        if not self.token:
+            return None
+        try:
+            tags = self.fetch_tags(repo_name)
+            if not tags:
+                return None
+            total_size = 0
+            for tag in tags[:3]:
+                digest = self.fetch_digest(repo_name, tag)
+                if not digest:
+                    continue
+                manifest = self.fetch_manifest(repo_name, digest)
+                if not manifest:
+                    continue
+                if manifest.get("schemaVersion") == 2:
+                    media_type = manifest.get("mediaType", "")
+                    if "manifest.list" in media_type or "image.index" in media_type:
+                        for m in manifest.get("manifests", []):
+                            m_digest = m.get("digest", "")
+                            if m_digest:
+                                m_manifest = self.fetch_manifest(repo_name, m_digest)
+                                if m_manifest:
+                                    if "config" in m_manifest:
+                                        total_size += m_manifest.get("config", {}).get("size", 0)
+                                    if "layers" in m_manifest:
+                                        for layer in m_manifest.get("layers", []):
+                                            total_size += layer.get("size", 0)
+                    else:
+                        if "config" in manifest:
+                            total_size += manifest.get("config", {}).get("size", 0)
+                        if "layers" in manifest:
+                            for layer in manifest.get("layers", []):
+                                total_size += layer.get("size", 0)
+            return total_size if total_size > 0 else None
+        except Exception as e:
+            return None
+
+    def fetch_manifest(self, repo_name, digest):
+        if not self.token:
+            return None
+        try:
+            token2 = getTokenForImageScope(self.registry_url, self.username, self.password, self.port, repo_name)
+            manifest = get_manifestlist(self.registry_url, self.username, self.password, self.port, token2, repo_name, digest)
+            if manifest:
+                return json.loads(manifest)
+            return None
+        except Exception:
+            return None
+
+    def build_tree(self):
+        repos = self.fetch_catalog()
+        if not repos:
+            return
+
+        self.root = TreeNode(self.registry_url, "registry", None, {"port": self.port})
+        self.root.expanded = True
+
+        dirs = {}
+        for repo in repos:
+            parts = repo.split('/')
+            if len(parts) >= 2:
+                dir_name = parts[0]
+                img_name = '/'.join(parts[1:])
+                if dir_name not in dirs:
+                    dirs[dir_name] = TreeNode(dir_name + "/", "directory", self.root)
+                img_data = {"repo": repo}
+                img_node = TreeNode(img_name, "image", dirs[dir_name], img_data)
+                dirs[dir_name].children.append(img_node)
+            else:
+                img_data = {"repo": repo}
+                img_node = TreeNode(repo, "image", self.root, img_data)
+                self.root.children.append(img_node)
+
+        for dir_node in dirs.values():
+            self.root.children.append(dir_node)
+
+        self.root.children.sort(key=lambda x: x.name)
+
+    def load_node_children(self, node):
+        if node.loaded:
+            return
+
+        if node.node_type == "image":
+            tags = self.fetch_tags(node.data["repo"])
+            for tag in tags:
+                tag_node = TreeNode(tag, "tag", node, {"repo": node.data["repo"], "tag": tag})
+                node.children.append(tag_node)
+        elif node.node_type == "tag":
+            tag_name = node.data.get("tag", "")
+            if tag_name.startswith("sha256-"):
+                digest = tag_name
+            else:
+                digest = self.fetch_digest(node.data["repo"], tag_name)
+            if digest:
+                node.data["digest"] = digest
+                manifest = self.fetch_manifest(node.data["repo"], digest)
+                if manifest:
+                    if manifest.get("schemaVersion") == 2:
+                        media_type = manifest.get("mediaType", "")
+                        if "manifest.list" in media_type or "image.index" in media_type:
+                            for m in manifest.get("manifests", []):
+                                platform = m.get("platform", {})
+                                os = platform.get("os", "?")
+                                arch = platform.get("architecture", "?")
+                                variant = platform.get("variant", "")
+                                if variant:
+                                    platform_str = f"({os}/{arch}/{variant})"
+                                else:
+                                    platform_str = f"({os}/{arch})"
+                                m_node = TreeNode(f"{m.get('digest', 'unknown')[:20]} {platform_str}", "manifest", node, m)
+                                node.children.append(m_node)
+                        elif "manifest.v2" in media_type or "image.manifest.v1" in media_type:
+                            if "layers" in manifest:
+                                for layer in manifest.get("layers", []):
+                                    blob_node = TreeNode(layer.get("digest", "unknown")[:30], "blob", node, layer)
+                                    node.children.append(blob_node)
+                            if "config" in manifest:
+                                config = manifest.get("config", {})
+                                blob_node = TreeNode(config.get("digest", "unknown")[:30], "blob", node, {"digest": config.get("digest"), "size": config.get("size"), "mediaType": config.get("mediaType")})
+                                node.children.append(blob_node)
+
+        elif node.node_type == "manifest":
+            manifest_digest = node.data.get("digest", "")
+            if manifest_digest:
+                repo = node.parent.data.get("repo") if node.parent and node.parent.data else None
+                if repo:
+                    manifest = self.fetch_manifest(repo, manifest_digest)
+                    if manifest:
+                        media_type = manifest.get("mediaType", "")
+                        if "manifest.v2" in media_type or "image.manifest.v1" in media_type:
+                            if "layers" in manifest:
+                                for layer in manifest.get("layers", []):
+                                    media_type = layer.get("mediaType", "")
+                                    short_type = media_type.split('.')[-1] if media_type else "?"
+                                    blob_node = TreeNode(f"{layer.get('digest', 'unknown')[:30]} ({short_type})", "blob", node, layer)
+                                    node.children.append(blob_node)
+                            if "config" in manifest:
+                                config = manifest.get("config", {})
+                                media_type = config.get("mediaType", "")
+                                short_type = media_type.split('.')[-1] if media_type else "?"
+                                blob_node = TreeNode(f"{config.get('digest', 'unknown')[:30]} ({short_type})", "blob", node, {"digest": config.get("digest"), "size": config.get("size"), "mediaType": config.get("mediaType")})
+                                node.children.append(blob_node)
+
+        node.loaded = True
+
+    def expand_to_blobs(self, node):
+        if node.node_type == "image":
+            self.load_node_children(node)
+            for child in node.children:
+                if child.node_type == "tag":
+                    child.expanded = True
+                    self.load_node_children(child)
+        elif node.node_type == "directory":
+            self.load_node_children(node)
+            for child in node.children:
+                if child.node_type in ("directory", "image"):
+                    child.expanded = True
+                    self.expand_to_blobs(child)
+        elif node.node_type == "tag":
+            self.load_node_children(node)
+            for child in node.children:
+                if child.node_type == "manifest":
+                    child.expanded = True
+                    self.load_node_children(child)
+
+    def get_visible_nodes(self):
+        self.visible_nodes = []
+        self._collect_visible(self.root, 0)
+        return self.visible_nodes
+
+    def _collect_visible(self, node, depth):
+        if not node:
+            return
+        self.visible_nodes.append((node, depth))
+        if node.expanded:
+            self.load_node_children(node)
+            for child in node.children:
+                self._collect_visible(child, depth + 1)
+
+    def run(self, stdscr):
+        curses.curs_set(0)
+        curses.start_color()
+        curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
+        curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
+        curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+        curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
+
+        if not self.username or not self.password:
+            self.get_credentials(stdscr)
+
+        if not self.authenticate():
+            self.show_message(stdscr, "Authentication failed. Check credentials.", error=True)
+            return
+
+        self.build_tree()
+        if not self.root or not self.root.children:
+            self.show_message(stdscr, "No repositories found.", error=True)
+            return
+
+        self.tree_view(stdscr)
+
+    def get_credentials(self, stdscr):
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        y = h // 2 - 5
+
+        stdscr.addstr(y, w // 2 - 15, "Quay Registry Client - Login", curses.A_BOLD)
+        stdscr.addstr(y + 2, w // 2 - 10, "Username: ")
+        stdscr.clrtoeol()
+        curses.echo()
+        username = stdscr.getstr(y + 2, w // 2 + 1, 30).decode('utf-8')
+        stdscr.addstr(y + 4, w // 2 - 10, "Password: ")
+        stdscr.clrtoeol()
+        password = stdscr.getstr(y + 4, w // 2 + 1, 30, ord('*')).decode('utf-8')
+        curses.noecho()
+
+        self.username = username
+        self.password = password
+        stdscr.clear()
+
+    def tree_view(self, stdscr):
+        while True:
+            stdscr.clear()
+            h, w = stdscr.getmaxyx()
+
+            title = f"Registry Browser - {self.registry_url}:{self.port}"
+            stdscr.addstr(0, (w - len(title)) // 2, title, curses.A_BOLD | curses.color_pair(1))
+            stdscr.addstr(1, 0, "=" * (w - 1))
+
+            visible = self.get_visible_nodes()
+            if not visible:
+                stdscr.addstr(3, 2, "No items to display.", curses.color_pair(3))
+            else:
+                visible_rows = h - 4
+                start_idx = max(0, self.selected_idx - visible_rows // 2)
+                end_idx = min(len(visible), start_idx + visible_rows)
+
+                for i in range(start_idx, end_idx):
+                    node, depth = visible[i]
+                    y = 2 + (i - start_idx)
+                    if y >= h - 2:
+                        break
+
+                    prefix = "  " * depth
+                    icon = "[?]"
+                    if node.node_type == "directory":
+                        icon = "[-]" if node.expanded else "[+]"
+                    elif node.node_type == "image":
+                        icon = "[I]"
+                        if not hasattr(node, '_tag_count_fetched'):
+                            repo = node.data.get("repo", "")
+                            if repo and self.token:
+                                tags = self.fetch_tags(repo)
+                                node._tag_count = len(tags) if tags else 0
+                                node._tag_count_fetched = True
+                        tag_count = getattr(node, '_tag_count', 0)
+                        if tag_count > 0:
+                            base_name = node.data.get("display_name", "")
+                            if not base_name:
+                                base_name = node.name.split(" (")[0] if " (" in node.name else node.name
+                                node.data["display_name"] = base_name
+                            if f"({tag_count} tags)" not in node.name:
+                                node.name = f"{base_name} ({tag_count} tags)"
+                    elif node.node_type == "tag":
+                        icon = "[T]"
+                    elif node.node_type == "blob":
+                        icon = "[B]"
+                    elif node.node_type == "manifest":
+                        icon = "[M]"
+                    elif node.node_type == "registry":
+                        icon = "[R]"
+
+                    display = f"{prefix}{icon} {node.name}"
+                    if i == self.selected_idx:
+                        stdscr.addstr(y, 2, display[:w-3], curses.A_REVERSE)
+                    else:
+                        color = curses.color_pair(1) if node.node_type == "directory" else \
+                                curses.color_pair(2) if node.node_type == "image" else \
+                                curses.color_pair(4) if node.node_type == "tag" else \
+                                curses.color_pair(5) if node.node_type == "manifest" else \
+                                curses.color_pair(3) if node.node_type == "blob" else \
+                                curses.color_pair(3)
+                        stdscr.addstr(y, 2, display[:w-3], color)
+
+            status = "[Space] Expand/Collapse | [Enter] View Details | [q] Quit"
+            stdscr.addstr(h - 1, 0, status[:w - 1])
+
+            key = stdscr.getch()
+
+            if key == ord('q'):
+                break
+            elif key == curses.KEY_UP:
+                self.selected_idx = max(0, self.selected_idx - 1)
+            elif key == curses.KEY_DOWN:
+                self.selected_idx = min(len(visible) - 1, self.selected_idx + 1)
+            elif key == ord(' '):
+                if 0 <= self.selected_idx < len(visible):
+                    node, _ = visible[self.selected_idx]
+                    old_expanded = node.expanded
+                    if node.node_type == "directory":
+                        node.expanded = not node.expanded
+                    elif node.node_type == "image":
+                        node.expanded = not node.expanded
+                        if node.expanded and not old_expanded:
+                            self.expand_to_blobs(node)
+                    elif node.node_type == "tag":
+                        node.expanded = not node.expanded
+                        if node.expanded and not old_expanded:
+                            self.load_node_children(node)
+                    elif node.node_type == "manifest":
+                        node.expanded = not node.expanded
+                        if node.expanded and not old_expanded:
+                            self.load_node_children(node)
+                    if not old_expanded:
+                        new_visible = self.get_visible_nodes()
+                        for i, (n, d) in enumerate(new_visible):
+                            if n == node:
+                                self.selected_idx = i
+                                break
+            elif key == ord('\n') or key == curses.KEY_ENTER:
+                if 0 <= self.selected_idx < len(visible):
+                    node, _ = visible[self.selected_idx]
+                    if node.node_type in ("image", "tag", "blob"):
+                        self.show_node_details(stdscr, node)
+
+    def show_node_details(self, stdscr, node):
+        while True:
+            stdscr.clear()
+            h, w = stdscr.getmaxyx()
+
+            title = f"Details: {node.name}"
+            stdscr.addstr(0, (w - len(title)) // 2, title, curses.A_BOLD | curses.color_pair(1))
+            stdscr.addstr(1, 0, "=" * (w - 1))
+
+            y = 3
+            stdscr.addstr(y, 2, f"Type: {node.node_type}", curses.color_pair(2))
+
+            if node.node_type == "image":
+                stdscr.addstr(y + 1, 2, f"Repository: {node.data.get('repo', 'N/A')}", curses.color_pair(1))
+                tags = self.fetch_tags(node.data.get("repo", ""))
+                stdscr.addstr(y + 2, 2, f"Tags ({len(tags)}): {', '.join(tags[:10])}{'...' if len(tags) > 10 else ''}")
+                stdscr.addstr(y + 3, 2, "Calculating size...")
+                stdscr.refresh()
+                size = self.calculate_image_size(node.data.get("repo", ""))
+                stdscr.addstr(y + 3, 2, " " * 50)
+                if size:
+                    stdscr.addstr(y + 3, 2, f"Size: ~{self.format_size(size)}")
+                else:
+                    stdscr.addstr(y + 3, 2, "Size: unavailable")
+            elif node.node_type == "tag":
+                stdscr.addstr(y + 1, 2, f"Repository: {node.data.get('repo', 'N/A')}", curses.color_pair(1))
+                stdscr.addstr(y + 2, 2, f"Tag: {node.data.get('tag', 'N/A')}", curses.color_pair(4))
+                digest = node.data.get("digest", "Loading...")
+                stdscr.addstr(y + 3, 2, f"Digest: {digest}", curses.color_pair(3))
+            elif node.node_type == "blob":
+                stdscr.addstr(y + 1, 2, f"Size: {node.data.get('size', 'N/A')}", curses.color_pair(1))
+                stdscr.addstr(y + 2, 2, f"MediaType: {node.data.get('mediaType', 'N/A')}", curses.color_pair(4))
+
+            stdscr.addstr(h - 1, 0, "Press [b] to go back or [q] to quit")
+
+            key = stdscr.getch()
+            if key == ord('b') or key == ord('q'):
+                break
+
+    def show_message(self, stdscr, message, error=False):
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        y = h // 2
+        color = curses.color_pair(3) if error else curses.color_pair(2)
+        stdscr.addstr(y, (w - len(message)) // 2, message, color)
+        stdscr.addstr(y + 2, (w - 20) // 2, "Press any key to exit...")
+        stdscr.getch()
+
+
 def main():
     parser = create_parser()
 
@@ -1380,6 +1866,10 @@ def main():
             print(f"Error: missing parameters delete-all-repo(registry_url={registry_url},Port={Port},token={token}")
             sys.exit(2)
         deleteallrepo(registry_url, username, password,Port,token)
+    elif cmd == "interactive":
+        from curses import wrapper
+        loop = QueryLoop(registry_url, Port, username, password, debug)
+        wrapper(loop.run)
     else:
         print("A command is needed.")
         print("")
@@ -1392,4 +1882,185 @@ def main():
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     main()
+    def __init__(self, registry_url, port, username, password, debug=False):
+        self.registry_url = registry_url
+        self.port = port
+        self.username = username
+        self.password = password
+        self.debug = debug
+        self.token = None
+        self.repositories = []
+        self.current_view = "main"
+        self.selected_idx = 0
+
+    def authenticate(self):
+        if not self.username or not self.password:
+            return False
+        try:
+            self.token = getToken(self.registry_url, self.username, self.password, self.port)
+            return True
+        except Exception:
+            return False
+
+    def fetch_catalog(self):
+        if not self.token:
+            if not self.authenticate():
+                return []
+        try:
+            images = fetch_catalog_v2(self.registry_url, self.username, self.password, self.port, self.token)
+            if images and "repositories" in images:
+                self.repositories = sorted(images["repositories"])
+            return self.repositories
+        except Exception:
+            return []
+
+    def fetch_tags(self, repo_name):
+        if not self.token:
+            if not self.authenticate():
+                return []
+        try:
+            token2 = getTokenForImageScope(self.registry_url, self.username, self.password, self.port, repo_name)
+            tags_data = get_tag_image(self.registry_url, self.username, self.password, self.port, token2, repo_name)
+            if tags_data and "tags" in tags_data:
+                return tags_data["tags"]
+            return []
+        except Exception:
+            return []
+
+    def run(self, stdscr):
+        curses.curs_set(0)
+        curses.start_color()
+        curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
+        curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
+
+        if not self.username or not self.password:
+            self.get_credentials(stdscr)
+
+        if not self.authenticate():
+            self.show_message(stdscr, "Authentication failed. Check credentials.", error=True)
+            return
+
+        while True:
+            if self.current_view == "main":
+                self.repositories = self.fetch_catalog()
+                if not self.repositories:
+                    self.show_message(stdscr, "No repositories found.", error=True)
+                    return
+                self.main_menu(stdscr)
+            elif self.current_view == "tags":
+                self.tags_view(stdscr)
+            elif self.current_view == "quit":
+                return
+
+    def get_credentials(self, stdscr):
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        y = h // 2 - 5
+
+        stdscr.addstr(y, w // 2 - 15, "Quay Registry Client - Login", curses.A_BOLD)
+        stdscr.addstr(y + 2, w // 2 - 10, "Username: ")
+        stdscr.clrtoeol()
+        curses.echo()
+        username = stdscr.getstr(y + 2, w // 2 + 1, 30).decode('utf-8')
+        stdscr.addstr(y + 4, w // 2 - 10, "Password: ")
+        stdscr.clrtoeol()
+        password = stdscr.getstr(y + 4, w // 2 + 1, 30, ord('*')).decode('utf-8')
+        curses.noecho()
+
+        self.username = username
+        self.password = password
+        stdscr.clear()
+
+    def main_menu(self, stdscr):
+        while self.current_view == "main":
+            stdscr.clear()
+            h, w = stdscr.getmaxyx()
+
+            title = f"Repositories - {self.registry_url}:{self.port}"
+            stdscr.addstr(0, (w - len(title)) // 2, title, curses.A_BOLD | curses.color_pair(1))
+            stdscr.addstr(1, 0, "=" * (w - 1))
+
+            if not self.repositories:
+                self.show_message(stdscr, "No repositories found.", error=True)
+                return
+
+            visible_rows = h - 4
+            start_idx = max(0, self.selected_idx - visible_rows // 2)
+            end_idx = min(len(self.repositories), start_idx + visible_rows)
+
+            for i, repo in enumerate(self.repositories[start_idx:end_idx]):
+                y = 2 + i
+                if y >= h - 2:
+                    break
+                if start_idx + i == self.selected_idx:
+                    stdscr.addstr(y, 2, f"> {repo}", curses.A_REVERSE)
+                else:
+                    stdscr.addstr(y, 2, f"  {repo}")
+
+            status = f"Total: {len(self.repositories)} | Use arrow keys, Enter to view tags, 'q' to quit"
+            stdscr.addstr(h - 1, 0, status[:w - 1])
+
+            key = stdscr.getch()
+
+            if key == ord('q'):
+                self.current_view = "quit"
+            elif key == curses.KEY_UP:
+                self.selected_idx = max(0, self.selected_idx - 1)
+            elif key == curses.KEY_DOWN:
+                self.selected_idx = min(len(self.repositories) - 1, self.selected_idx + 1)
+            elif key == ord('\n') or key == curses.KEY_ENTER:
+                if 0 <= self.selected_idx < len(self.repositories):
+                    self.current_repo = self.repositories[self.selected_idx]
+                    self.current_tags = self.fetch_tags(self.current_repo)
+                    self.current_view = "tags"
+
+    def tags_view(self, stdscr):
+        while self.current_view == "tags":
+            stdscr.clear()
+            h, w = stdscr.getmaxyx()
+
+            title = f"Tags - {self.current_repo}"
+            stdscr.addstr(0, (w - len(title)) // 2, title, curses.A_BOLD | curses.color_pair(1))
+            stdscr.addstr(1, 0, "=" * (w - 1))
+
+            if not self.current_tags:
+                stdscr.addstr(3, 2, "No tags found.", curses.color_pair(3))
+            else:
+                visible_rows = h - 4
+                start_idx = max(0, self.selected_idx - visible_rows // 2)
+                end_idx = min(len(self.current_tags), start_idx + visible_rows)
+
+                for i, tag in enumerate(self.current_tags[start_idx:end_idx]):
+                    y = 2 + i
+                    if y >= h - 2:
+                        break
+                    if start_idx + i == self.selected_idx:
+                        stdscr.addstr(y, 2, f"> {tag}", curses.A_REVERSE)
+                    else:
+                        stdscr.addstr(y, 2, f"  {tag}")
+
+            status = f"Tags: {len(self.current_tags)} | Use arrow keys, 'b' to go back, 'q' to quit"
+            stdscr.addstr(h - 1, 0, status[:w - 1])
+
+            key = stdscr.getch()
+
+            if key == ord('q'):
+                self.current_view = "quit"
+            elif key == ord('b'):
+                self.selected_idx = 0
+                self.current_view = "main"
+            elif key == curses.KEY_UP:
+                self.selected_idx = max(0, self.selected_idx - 1)
+            elif key == curses.KEY_DOWN:
+                self.selected_idx = min(len(self.current_tags) - 1, self.selected_idx + 1)
+
+    def show_message(self, stdscr, message, error=False):
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        y = h // 2
+        color = curses.color_pair(3) if error else curses.color_pair(2)
+        stdscr.addstr(y, (w - len(message)) // 2, message, color)
+        stdscr.addstr(y + 2, (w - 20) // 2, "Press any key to exit...")
+        stdscr.getch()
 
