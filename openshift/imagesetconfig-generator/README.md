@@ -10,6 +10,8 @@ This tool connects to an Operator Catalog image (e.g., `redhat-operator-index`),
 * **Automated Discovery:** Pulls the catalog image and inspects the internal `/configs` directory of this catalog.
 * **Version Support:** Supports both `oc-mirror` **v1** (`mirror.openshift.io/v1alpha2`) and **v2** (`mirror.openshift.io/v2alpha1`).
 * **Smart Sorting:** Uses natural sorting for channels (e.g., ensures `4.10` comes after `4.9`).
+* **Version Listing (`--version-comment`):** Adds the full list of available versions as a comment below each channel, making it easy to pick versions.
+* **minVersion/maxVersion (`--min-max-version`):** Automatically emits `minVersion`/`maxVersion` keys per channel from the channel's version list. Can be combined with `--version-comment`.
 * **Flexible Fetching:**
 * Handles TLS verification toggling.
 * **GPG Bypass:** Includes a `--disable-signature-policy` flag to force-pull Red Hat images on systems where gpg signature prevent it.
@@ -62,6 +64,8 @@ The general syntax is:
 | `--disable-signature-policy` | No | Bypasses GPG signature verification, useful if your container gpg policy prevent it. |
 | `--tls-verify` | No | Toggle TLS verification (`true`/`false`). Default is `true`. |
 | `--timeout` | No | Timeout in seconds for the pull operation (default: 600). |
+| `--version-comment` | No | Adds the full list of available versions as a comment below each channel. |
+| `--min-max-version` | No | Adds `minVersion`/`maxVersion` keys per channel based on the available versions. Can be combined with `--version-comment`. |
 
 ## Workflow & Examples
 
@@ -111,25 +115,45 @@ If you have already extracted the FBC data to a folder (e.g., `/tmp/my_configs`)
 
 ```
 
+### 4. Add Available Versions / minVersion & maxVersion
+
+Add the full list of available versions as a comment below each channel, plus
+auto-generated `minVersion`/`maxVersion` keys for use with `oc-mirror`:
+
+```bash
+./imagesetconfig-generator.py \
+  -c registry.redhat.io/redhat/redhat-operator-index:v4.20 \
+  --generate config.yaml \
+  --v2 \
+  --version-comment \
+  --min-max-version
+
+```
+
 ## Output Format
 
 The tool generates a valid `ImageSetConfiguration` YAML.
 
-**Example Output (v2):**
+**Example Output (v2, with `--version-comment --min-max-version`):**
 
 ```yaml
 apiVersion: mirror.openshift.io/v2alpha1
 kind: ImageSetConfiguration
 mirror:
   operators:
-  - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.16
+  - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.20
     packages:
-    - name: advanced-cluster-management
+    - name: quay-operator
       channels:
-      - name: release-2.9
-      - name: release-2.10
-      defaultChannel: release-2.10
-      _default: release-2.10  # default
+      - name: stable-3.6
+      # versions: 3.6.0, 3.6.1, 3.6.2, 3.6.4, 3.6.5, 3.6.6, 3.6.7, 3.6.8, 3.6.9, 3.6.10
+        minVersion: 3.6.0
+        maxVersion: 3.6.10
+      - name: stable-3.17  # default
+      # versions: 3.17.0, 3.17.1, 3.17.2, 3.17.3
+        minVersion: 3.17.0
+        maxVersion: 3.17.3
+      defaultChannel: stable-3.17
 
 ```
 

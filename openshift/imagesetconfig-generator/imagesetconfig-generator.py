@@ -12,7 +12,22 @@ import signal
 import time
 
 # --- Global Configuration ---
-VERSION = "0.13"
+VERSION = "0.14"
+
+# TODO:
+# 1. [FIXED] write_image_set_config: the '# default' comment (and _default stripping)
+#    relied on substring matching and could match the wrong package/channel (e.g. a
+#    package whose name is a prefix of another, like amq-streams vs amq-streams-console).
+#    Now uses exact name matching via regex + op_defaults dict. Also fixed YAML-quoted
+#    channel names (e.g. '3.15') breaking lookups.
+# 2. [DOC] README example output (line ~132) shows '_default: release-2.10  # default',
+#    but the code strips '_default:' lines and only appends '  # default' as a comment.
+# 3. [REFACTOR] write_image_set_config: pkg_entry['_default'] is stored on every entry
+#    regardless of version, then only used for comment annotation. Compute the '# default'
+#    marker directly instead.
+# 4. [BUG] handle_extract does not pass '--tls-verify' to 'podman create/cp', so the
+#    TLS toggle only affects the pull step. Also handle_fetch uses 'podman search' as an
+#    extra network call for auth verification.
 
 # --- Helper Utilities ---
 
@@ -94,8 +109,14 @@ def handle_extract(catalog, dest_path):
             subprocess.run(['podman', 'rm', '-f', container_id], capture_output=True)
 
 def handle_parse_fbc(config_dir, verbose=False):
-    """Walks the config directory and builds a map of packages and channels."""
+    """Walks the config directory and builds a map of packages and channels.
+
+    Returns a dict of pkg -> {"channels": set, "default": str,
+    "versions": {channel: [sorted versions]}}. Versions are resolved from the
+    'olm.package' property of each bundle (falling back to the bundle name).
+    """
     pkg_map = {}
+    bundle_versions = {}
     print(f"\n{'STATUS':<12} | {'OPERATOR':<35} | {'CHANNEL/VERSION'}")
     print("-" * 80)
     for root, _, files in os.walk(config_dir):
@@ -125,7 +146,7 @@ def handle_parse_fbc(config_dir, verbose=False):
                             if doc.get('schema') == 'olm.package':
                                 name = doc.get('name')
                                 if name:
-                                    if name not in pkg_map: pkg_map[name] = {"channels": set(), "default": None}
+                                    if name not in pkg_map: pkg_map[name] = {"channels": set(), "default": None, "versions": {}}
                                     pkg_map[name]["default"] = doc.get('defaultChannel')
                                     if not verbose:
                                         print(f"{'PACKAGE':<12} | {name:<35} | Default: {doc.get('defaultChannel')}")
@@ -133,11 +154,23 @@ def handle_parse_fbc(config_dir, verbose=False):
                                 pkg = doc.get('package')
                                 chan = doc.get('name')
                                 if pkg and chan:
-                                    if pkg not in pkg_map: pkg_map[pkg] = {"channels": set(), "default": None}
+                                    if pkg not in pkg_map: pkg_map[pkg] = {"channels": set(), "default": None, "versions": {}}
                                     if chan not in pkg_map[pkg]["channels"]:
                                         pkg_map[pkg]["channels"].add(chan)
+                                        pkg_map[pkg]["versions"][chan] = []
                                         if not verbose:
                                             print(f"{'CHANNEL':<12} | {pkg:<35} | -> {chan}")
+                                    for entry in (doc.get('entries') or []):
+                                        ename = entry.get('name')
+                                        if ename and ename not in pkg_map[pkg]["versions"][chan]:
+                                            pkg_map[pkg]["versions"][chan].append(ename)
+                            elif doc.get('schema') == 'olm.bundle':
+                                name = doc.get('name')
+                                if name:
+                                    for prop in (doc.get('properties') or []):
+                                        if prop.get('type') == 'olm.package':
+                                            bundle_versions[name] = prop.get('value', {}).get('version')
+                                            break
                 except Exception as e:
                     if verbose: print(f" FAIL ({e})")
                     else: print(f"Warning: Could not parse {file}: {e}")
@@ -145,10 +178,28 @@ def handle_parse_fbc(config_dir, verbose=False):
                 # Should not happen given is_target logic, but good for safety
                 print(" SKIP (No Parser)")
 
+    # Resolve channel entry names to versions, sorted naturally
+    for pkg in pkg_map:
+        for chan in pkg_map[pkg]["versions"]:
+            versions = set()
+            for ename in pkg_map[pkg]["versions"][chan]:
+                v = bundle_versions.get(ename)
+                if not v:
+                    m = re.search(r'\.v([0-9][^/]*)$', ename)
+                    v = m.group(1) if m else ename
+                if v: versions.add(v)
+            pkg_map[pkg]["versions"][chan] = sorted(versions, key=natural_sort_key)
+
     return pkg_map
 
-def write_image_set_config(output_file, catalog, pkg_map, version='v1'):
-    """Generates the YAML file with version-specific validation and formatting."""
+def write_image_set_config(output_file, catalog, pkg_map, version='v1', version_comments=False, min_max_version=False):
+    """Generates the YAML file with version-specific validation and formatting.
+
+    If version_comments is True, a '# versions: ...' comment is emitted below
+    each channel listing the available versions.
+    If min_max_version is True, each channel gets 'minVersion'/'maxVersion' keys
+    (first/last of the channel's sorted versions) instead of the comment.
+    """
     op_list = []
     for pkg in sorted(pkg_map.keys()):
         data = pkg_map[pkg]
@@ -160,7 +211,15 @@ def write_image_set_config(output_file, catalog, pkg_map, version='v1'):
         if actual_default not in sorted_chans:
             actual_default = sorted_chans[-1]
 
-        pkg_entry = {"name": pkg, "channels": [{"name": c} for c in sorted_chans]}
+        channels = [{"name": c} for c in sorted_chans]
+        if min_max_version:
+            for ch in channels:
+                versions = data.get("versions", {}).get(ch["name"])
+                if versions:
+                    ch["minVersion"] = versions[0]
+                    ch["maxVersion"] = versions[-1]
+
+        pkg_entry = {"name": pkg, "channels": channels}
         if version == 'v2': pkg_entry["defaultChannel"] = actual_default
         pkg_entry["_default"] = actual_default
         op_list.append(pkg_entry)
@@ -168,15 +227,28 @@ def write_image_set_config(output_file, catalog, pkg_map, version='v1'):
     api_version = "mirror.openshift.io/v2alpha1" if version == 'v2' else "mirror.openshift.io/v1alpha2"
     config = {"apiVersion": api_version, "kind": "ImageSetConfiguration", "mirror": {"operators": [{"catalog": catalog, "packages": op_list}]}}
     raw_yaml = yaml.dump(config, default_flow_style=False, sort_keys=False)
-    
+
     final_lines = []
+    op_defaults = {p['name']: p['_default'] for p in op_list}
+    current_pkg = None
     current_default = None
     for line in raw_yaml.splitlines():
-        if "- name:" in line and "channels:" not in line:
-            pkg_match = [p for p in op_list if f"name: {p['name']}" in line]
-            if pkg_match: current_default = pkg_match[0]['_default']
-        if current_default and f"name: {current_default}" in line and "defaultChannel:" not in line: line += "  # default"
+        pkg_line = re.match(r'^ {4}- name: (.+)$', line)
+        chan_line = re.match(r'^ {6}- name: (.+?)(\s*#.*)?$', line)
+        if pkg_line and "channels:" not in line:
+            pkg_name = pkg_line.group(1).strip().strip("'\"")
+            if pkg_name in op_defaults:
+                current_pkg = pkg_name
+                current_default = op_defaults[pkg_name]
+        if chan_line:
+            chan = chan_line.group(1).strip().strip("'\"")
+            if current_default and chan == current_default:
+                line = line.rstrip() + "  # default"
         if "_default:" not in line: final_lines.append(line)
+        if version_comments and current_pkg and chan_line:
+            versions = pkg_map[current_pkg].get("versions", {}).get(chan)
+            if versions:
+                final_lines.append(f"      # versions: {', '.join(versions)}")
 
     with open(output_file, 'w') as f: f.write("\n".join(final_lines))
     print(f"\n--- SUCCESS: Generated {output_file} (Format: {version}) ---")
@@ -212,6 +284,8 @@ Examples of usage:
     parser.add_argument('--timeout', type=int, default=600, help='Timeout for podman pull (default: 600s)')
     parser.add_argument('--tls-verify', type=str2bool, default=True, help='Toggle TLS verification (true/false)')
     parser.add_argument('--disable-signature-policy', action='store_true', help='Bypass GPG signature checks')
+    parser.add_argument('--version-comment', action='store_true', help='Add available versions as a comment below each channel')
+    parser.add_argument('--min-max-version', action='store_true', help='Add minVersion/maxVersion keys per channel (can be combined with --version-comment)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging of file processing')
     
     v_group = parser.add_mutually_exclusive_group()
@@ -243,7 +317,9 @@ Examples of usage:
         mirror_version = 'v2' if args.v2 else 'v1'
         pkg_map = handle_parse_fbc(config_path, verbose=args.verbose)
         write_image_set_config(args.generate if args.generate.endswith('.yaml') else args.generate + '.yaml', 
-                               args.catalog, pkg_map, version=mirror_version)
+                               args.catalog, pkg_map, version=mirror_version,
+                               version_comments=args.version_comment,
+                               min_max_version=args.min_max_version)
 
 if __name__ == "__main__":
     main()
