@@ -3,7 +3,9 @@
 A Python utility to automate the creation of `ImageSetConfiguration` YAML files for OpenShift's `oc-mirror` tool.
 
 Manually crafting configuration files for disconnected (air-gapped) cluster updates is tedious and error-prone. 
-This tool connects to an Operator Catalog image (e.g., `redhat-operator-index`), extracts the internal File-Based Catalog (FBC) data, and reverse-engineers a perfect configuration file containing all available packages and channels.
+This tool connects to an Operator Catalog image (e.g., `redhat-operator-index`, `community-operators`, `certified-operators`), extracts the internal File-Based Catalog (FBC) data, and generates a perfect `ImageSetConfiguration` file containing all available packages and channels.
+
+For a deep dive into how catalog images are built and how this tool deciphers them, see [doc/design.md](doc/design.md).
 
 ## Features
 
@@ -13,9 +15,9 @@ This tool connects to an Operator Catalog image (e.g., `redhat-operator-index`),
 * **Version Listing (`--version-comment`):** Adds the full list of available versions as a comment below each channel, making it easy to pick versions.
 * **minVersion/maxVersion (`--min-max-version`):** Automatically emits `minVersion`/`maxVersion` keys per channel from the channel's version list. Can be combined with `--version-comment`.
 * **Flexible Fetching:**
-* Handles TLS verification toggling.
-* **GPG Bypass:** Includes a `--disable-signature-policy` flag to force-pull Red Hat images on systems where gpg signature prevent it.
-* Configurable timeouts for slow connections.
+  * Handles TLS verification toggling.
+  * Configurable timeouts for slow connections.
+* **GPG Bypass:** Includes a `--disable-signature-policy` flag for non-Red Hat systems where podman has signature verification enabled but the Red Hat GPG key is not in the trust store.
 
 
 
@@ -23,9 +25,13 @@ This tool connects to an Operator Catalog image (e.g., `redhat-operator-index`),
 
 * **Python 3.x**
 * **Podman:** The script wraps Podman CLI commands (`pull`, `create`, `cp`). Podman must be installed and available in your system `$PATH`.
-* **Python Libraries:**
+* **Python Libraries:** `pyyaml`. Install it with pip, or from your distribution's package manager:
 ```bash
 pip install pyyaml
+```
+```bash
+sudo dnf install python3-pyyaml   # Fedora/RHEL
+sudo apt install python3-yaml     # Debian/Ubuntu
 
 ```
 
@@ -33,11 +39,23 @@ pip install pyyaml
 
 ## Installation
 
-1. Clone this repository.
-2. Make the script executable:
+Only `imagesetconfig-generator.py` is needed to run the tool — copy it anywhere, make it executable, and you're set:
+
 ```bash
 chmod +x imagesetconfig-generator.py
 
+```
+
+The `tests/` directory is only required if you want to run the test suite.
+
+## Testing
+
+The test suite covers FBC parsing and YAML generation against the real codebase, using only the Python standard library (`unittest`) and `pyyaml`.
+
+See [tests/README.md](tests/README.md) for the full test infrastructure documentation.
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 
@@ -55,24 +73,27 @@ The general syntax is:
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `-c`, `--catalog` | **Yes** | The full URL of the catalog image (e.g., `registry.redhat.io/redhat/redhat-operator-index:v4.16`). |
+| `-c`, `--catalog` | **Yes** | The full URL of the catalog image (e.g., `registry.redhat.io/redhat/redhat-operator-index:v4.20`). |
 | `--fetch` | No | Authenticates and pulls the image using Podman. |
 | `--extract` | No | Creates a temp container and extracts the FBC configs to disk in /tmp/. |
 | `--generate` | No | The output filename for the YAML config (e.g., `myset.yaml`). |
 | `--v1` / `--v2` | No | Toggle between `v1alpha2` (v1) and `v2alpha1` (v2) output formats. |
 | `--configs` | No | Path to a local directory containing FBC files (if skipping fetch/extract), by default it is on /tmp/. |
-| `--disable-signature-policy` | No | Bypasses GPG signature verification, useful if your container gpg policy prevent it. |
+| `--disable-signature-policy` | No | Bypasses GPG signature verification when podman has it enabled but the Red Hat GPG key is missing from the trust store. Use only with registries you trust. |
 | `--tls-verify` | No | Toggle TLS verification (`true`/`false`). Default is `true`. |
 | `--timeout` | No | Timeout in seconds for the pull operation (default: 600). |
 | `--version-comment` | No | Adds the full list of available versions as a comment below each channel. |
 | `--min-max-version` | No | Adds `minVersion`/`maxVersion` keys per channel based on the available versions. Can be combined with `--version-comment`. |
+| `--verbose` | No | Enables verbose logging of file processing during generation. |
 
 ## Workflow & Examples
 
 The tool is designed to run the following pipeline by default : **Fetch**  **Extract**  **Generate**.
 But you can launch each step manually.
 The fetch is done by podman pull, and is only done one time on the first fetch and the catalog image stay on the disk.
-You have to manually remove that catalog image if you don't plane to use that program a second time.
+You have to manually remove that catalog image if you don't plan to use that program a second time.
+
+By default the extracted FBC configs are written to `/tmp/<sanitized-catalog>/` (e.g. `/tmp/registry_redhat_io_redhat_redhat-operator-index_v4_20/`), so the extract step consumes disk space in your `/tmp` folder. Use `--configs` to point the tool at another location.
 
 ### 1. The "All-in-One" Run
 
@@ -80,7 +101,7 @@ This authenticates, pulls the image, extracts the config, and generates a **v2**
 
 ```bash
 ./imagesetconfig-generator.py \
-  -c registry.redhat.io/redhat/redhat-operator-index:v4.16 \
+  -c registry.redhat.io/redhat/redhat-operator-index:v4.20 \
   --fetch \
   --extract \
   --generate config-v2.yaml \
@@ -88,13 +109,17 @@ This authenticates, pulls the image, extracts the config, and generates a **v2**
 
 ```
 
-### 2. Bypass GPG Signatures (e.g., on macOS/Ubuntu)
+### 2. Bypass GPG Signature Policy (non-Red Hat systems)
 
-If you encounter signature errors pulling Red Hat images, use the bypass flag.
+On systems where podman has signature verification enabled but Red Hat's GPG
+keys are not present in the trust store (e.g. standard Fedora/Ubuntu podman
+installs, where the pull of a Red Hat image fails with a signature error), the
+`--disable-signature-policy` flag bypasses that check. Only use it when you
+trust the registry you are pulling from:
 
 ```bash
 ./imagesetconfig-generator.py \
-  -c registry.redhat.io/redhat/redhat-operator-index:v4.15 \
+  -c registry.redhat.io/redhat/redhat-operator-index:v4.20 \
   --fetch \
   --disable-signature-policy \
   --extract \
@@ -104,7 +129,7 @@ If you encounter signature errors pulling Red Hat images, use the bypass flag.
 
 ### 3. Generate from Local Configs
 
-If you have already extracted the FBC data to a folder (e.g., `/tmp/my_configs`), you can generate the YAML without connecting to a registry.
+If you have already extracted the FBC data to a folder (e.g., `/tmp/my_configs`), you can generate the YAML without pulling the image a second time from the registry.
 
 ```bash
 ./imagesetconfig-generator.py \

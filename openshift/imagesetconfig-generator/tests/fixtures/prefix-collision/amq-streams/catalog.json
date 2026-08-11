@@ -1,0 +1,36 @@
+{
+  "schema": "olm.package",
+  "name": "amq-streams",
+  "defaultChannel": "stable"
+}
+{
+  "schema": "olm.channel",
+  "package": "amq-streams",
+  "name": "stable",
+  "entries": [
+    { "name": "amq-streams.v2.2.0" },
+    { "name": "amq-streams.v2.10.0", "replaces": "amq-streams.v2.2.0" },
+    { "name": "amq-streams.v2.11.0", "replaces": "amq-streams.v2.10.0" }
+  ]
+}
+{
+  "schema": "olm.bundle",
+  "name": "amq-streams.v2.2.0",
+  "properties": [
+    { "type": "olm.package", "value": { "packageName": "amq-streams", "version": "2.2.0" } }
+  ]
+}
+{
+  "schema": "olm.bundle",
+  "name": "amq-streams.v2.10.0",
+  "properties": [
+    { "type": "olm.package", "value": { "packageName": "amq-streams", "version": "2.10.0" } }
+  ]
+}
+{
+  "schema": "olm.bundle",
+  "name": "amq-streams.v2.11.0",
+  "properties": [
+    { "type": "olm.package", "value": { "packageName": "amq-streams", "version": "2.11.0" } }
+  ]
+}

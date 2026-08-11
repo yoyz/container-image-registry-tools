@@ -1,0 +1,20 @@
+{
+  "schema": "olm.package",
+  "name": "sample-operator",
+  "defaultChannel": "stable"
+}
+{
+  "schema": "olm.channel",
+  "package": "sample-operator",
+  "name": "stable",
+  "entries": [
+    { "name": "sample-operator.v1.0.0" }
+  ]
+}
+{
+  "schema": "olm.bundle",
+  "name": "sample-operator.v1.0.0",
+  "properties": [
+    { "type": "olm.csv.metadata" }
+  ]
+}

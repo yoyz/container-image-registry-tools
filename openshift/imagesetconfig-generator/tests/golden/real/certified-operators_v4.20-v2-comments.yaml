@@ -1,0 +1,548 @@
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+mirror:
+  operators:
+  - catalog: example.com/operators/real-catalog:v1
+    packages:
+    - name: airlock-microgateway
+      channels:
+      - name: '4.8'
+      # versions: 4.8.0, 4.8.1, 4.8.2, 4.8.3, 4.8.4, 4.8.5, 4.8.6, 4.8.7, 4.8.8, 4.8.9, 4.8.10, 4.8.11
+      - name: '5.0'
+      # versions: 5.0.0, 5.0.1, 5.0.2, 5.0.3, 5.0.4, 5.0.5, 5.0.6, 5.0.7
+      - name: '5.1'  # default
+      # versions: 5.1.1, 5.1.2, 5.1.3, 5.1.4
+      - name: stable
+      # versions: 4.8.0, 4.8.1, 4.8.2, 4.8.3, 4.8.4, 4.8.5, 5.0.0, 5.0.1, 5.0.2, 5.0.3, 5.0.4, 5.0.5, 5.1.1, 5.1.2, 5.1.3, 5.1.4
+      defaultChannel: '5.1'
+    - name: alloydb-omni-operator-certified
+      channels:
+      - name: stable  # default
+      # versions: 1.7.0, 1.7.1, 1.8.0
+      defaultChannel: stable
+    - name: amd-gpu-operator
+      channels:
+      - name: alpha  # default
+      # versions: 1.1.1, 1.2.1, 1.3.1, 1.3.2, 1.4.1, 1.5.0, 1.5.1, 1.5.2
+      defaultChannel: alpha
+    - name: appian-operator
+      channels:
+      - name: alpha  # default
+      # versions: 0.171.0, 0.184.0, 0.200.0, 0.205.0
+      defaultChannel: alpha
+    - name: clife
+      channels:
+      - name: '1.16'
+      # versions: 1.16.17-cee.1, 1.16.19-cee.1, 1.16.20-cee.1, 1.16.21-cee.1, 1.16.22-cee.1, 1.16.23-cee.1
+      - name: '1.17'
+      # versions: 0.0.1, 1.17.4-cee.1, 1.17.5-cee.1, 1.17.7-cee.1, 1.17.8-cee.1, 1.17.9-cee.1, 1.17.10-cee.1, 1.17.10-cee.2, 1.17.12-cee.1, 1.17.13-cee.1, 1.17.14-cee.1, 1.17.15-cee.1, 1.17.16-cee.1, 1.17.17-cee.1
+      - name: '1.18'
+      # versions: 1.18.4-cee.1, 1.18.6-cee.1, 1.18.6-cee.2, 1.18.7-cee.1, 1.18.8-cee.1, 1.18.8-cee.2, 1.18.9-cee.1, 1.18.10-cee.1, 1.18.11-cee.1
+      - name: '1.19'  # default
+      # versions: 1.19.5-cee.1
+      defaultChannel: '1.19'
+    - name: cloud-native-postgresql
+      channels:
+      - name: candidate
+      # versions: 1.26.0-rc1, 1.26.0-rc2, 1.26.0-rc3, 1.27.0-rc1, 1.28.0-rc1, 1.28.0-rc2, 1.29.0-rc1, 1.30.0-rc1
+      - name: fast  # default
+      # versions: 1.25.0, 1.25.1, 1.25.2, 1.26.0, 1.26.1, 1.27.0, 1.27.1, 1.28.0, 1.28.1, 1.28.2, 1.29.0, 1.29.1, 1.29.2, 1.30.0
+      - name: stable
+      # versions: 1.25.0, 1.25.1, 1.25.2, 1.25.3, 1.25.4, 1.25.5, 1.28.0, 1.28.1, 1.28.2, 1.29.0
+      - name: stable-v1.25
+      # versions: 1.25.0, 1.25.1, 1.25.2, 1.25.3, 1.25.4, 1.25.5, 1.25.6, 1.25.7, 1.25.8, 1.25.9
+      - name: stable-v1.26
+      # versions: 1.26.0, 1.26.1, 1.26.2, 1.26.3
+      - name: stable-v1.27
+      # versions: 1.27.0, 1.27.1, 1.27.2, 1.27.3, 1.27.4
+      - name: stable-v1.28
+      # versions: 1.28.0, 1.28.1, 1.28.2, 1.28.3, 1.28.4
+      - name: stable-v1.29
+      # versions: 1.29.0, 1.29.1, 1.29.2
+      - name: stable-v1.30
+      # versions: 1.30.0
+      defaultChannel: fast
+    - name: cloudnative-pg
+      channels:
+      - name: candidate
+      # versions: 1.26.0-rc1, 1.26.0-rc2, 1.26.0-rc3, 1.27.0-rc1, 1.28.0-rc1, 1.28.0-rc2, 1.29.0-rc1, 1.30.0-rc1
+      - name: stable-v1  # default
+      # versions: 1.23.1, 1.23.2, 1.23.3, 1.24.0, 1.24.1, 1.25.0, 1.25.1, 1.26.0, 1.26.1, 1.27.0, 1.27.1, 1.28.0, 1.28.1, 1.28.2, 1.29.0, 1.29.1, 1.29.2, 1.30.0
+      defaultChannel: stable-v1
+    - name: couchbase-enterprise-certified
+      channels:
+      - name: 2.7.0
+      # versions: 2.7.0-5
+      - name: 2.7.1
+      # versions: 2.7.1-1
+      - name: 2.8.0
+      # versions: 2.8.0-1, 2.8.0-2
+      - name: 2.8.1
+      # versions: 2.8.1-1, 2.8.1-2
+      - name: 2.8.2
+      # versions: 2.8.2-1
+      - name: 2.9.0
+      # versions: 2.9.0-1, 2.9.0-2, 2.9.0-3
+      - name: 2.9.1
+      # versions: 2.9.1-1
+      - name: 2.9.2
+      # versions: 2.9.2-2, 2.9.2-3
+      - name: stable  # default
+      # versions: 2.8.1-1, 2.8.1-2, 2.8.2-1, 2.9.0-1, 2.9.0-2, 2.9.0-3, 2.9.1-1, 2.9.2-2, 2.9.2-3
+      defaultChannel: stable
+    - name: crunchy-postgres-operator
+      channels:
+      - name: v5  # default
+      # versions: 5.1.0, 5.1.1, 5.1.2, 5.1.3, 5.2.0, 5.3.0, 5.4.0, 5.4.1, 5.4.2, 5.4.3, 5.4.4, 5.5.0, 5.5.1, 5.5.2, 5.6.0, 5.6.1, 5.7.0, 5.7.1, 5.7.2, 5.7.3, 5.7.4, 5.8.0, 5.8.1, 5.8.2, 5.8.3, 5.8.4, 5.8.5, 5.8.6, 5.8.7, 5.8.8
+      defaultChannel: v5
+    - name: dell-csm-operator-certified
+      channels:
+      - name: stable  # default
+      # versions: 1.6.1, 1.7.0, 1.8.0, 1.8.1, 1.9.0, 1.9.1, 1.10.0, 1.10.1, 1.10.2, 1.11.0, 1.11.1, 1.11.2, 1.11.3, 1.12.0, 1.12.1, 1.12.2
+      defaultChannel: stable
+    - name: dxoperator
+      channels:
+      - name: alpha  # default
+      # versions: 1.0.77, 1.0.78
+      defaultChannel: alpha
+    - name: dxoperator-v2
+      channels:
+      - name: alpha  # default
+      # versions: 2.0.85, 2.0.86, 2.0.87, 2.0.88
+      defaultChannel: alpha
+    - name: eda-k8s-operator
+      channels:
+      - name: '6.0'  # default
+      # versions: 6.0.0, 6.0.1
+      - name: stable
+      # versions: 6.0.0
+      defaultChannel: '6.0'
+    - name: edb-hcp-operator
+      channels:
+      - name: alpha
+      # versions: 1.3.3, 1.3.4, 1.3.5, 1.3.6, 1.3.7, 1.3.8, 1.3.9, 1.3.10
+      - name: innovation
+      # versions: 2026.1.0, 2026.2.0, 2026.3.0, 2026.4.1, 2026.5.0, 2026.5.1
+      - name: lts-v1.3
+      # versions: 1.3.3, 1.3.4, 1.3.5, 1.3.6, 1.3.7, 1.3.8, 1.3.9, 1.3.10
+      - name: stable  # default
+      # versions: 1.3.3, 1.3.4, 1.3.5, 1.3.6, 1.3.7, 1.3.8, 1.3.9, 2.0.0, 2.1.0
+      defaultChannel: stable
+    - name: f5-ai-security-operator
+      channels:
+      - name: alpha
+      # versions: 0.4.3
+      - name: release-testing
+      # versions: 0.0.2, 0.0.3
+      - name: stable  # default
+      # versions: 0.6.1, 0.7.2, 0.8.0, 0.8.1, 0.8.2, 0.9.0, 0.10.5, 0.11.2, 0.11.3, 0.11.4
+      defaultChannel: stable
+    - name: gpu-operator-certified
+      channels:
+      - name: stable
+      # versions: 1.10.0, 1.10.1, 1.11.0, 1.11.1, 22.9.0, 22.9.1, 22.9.2, 23.3.0, 23.3.1, 23.3.2, 23.6.0, 23.6.1, 23.9.0, 23.9.1, 23.9.2, 24.3.0, 24.6.0, 24.6.1, 24.6.2, 24.9.0, 24.9.1, 24.9.2, 25.3.0, 25.3.1, 25.3.2, 25.3.3, 25.3.4, 25.10.0, 25.10.1, 26.3.0, 26.3.1, 26.3.2, 26.3.3
+      - name: v1.10
+      # versions: 1.10.0, 1.10.1
+      - name: v1.11
+      # versions: 1.10.0, 1.10.1, 1.11.0, 1.11.1
+      - name: v22.9
+      # versions: 1.10.0, 1.10.1, 1.11.0, 1.11.1, 22.9.0, 22.9.1, 22.9.2
+      - name: v23.3
+      # versions: 1.10.0, 1.10.1, 1.11.0, 1.11.1, 22.9.0, 22.9.1, 22.9.2, 23.3.0, 23.3.1, 23.3.2
+      - name: v23.6
+      # versions: 1.10.0, 1.10.1, 1.11.0, 1.11.1, 22.9.0, 22.9.1, 22.9.2, 23.3.0, 23.3.1, 23.3.2, 23.6.0, 23.6.1
+      - name: v23.9
+      # versions: 1.10.0, 1.10.1, 1.11.0, 1.11.1, 22.9.0, 22.9.1, 22.9.2, 23.3.0, 23.3.1, 23.3.2, 23.6.0, 23.6.1, 23.9.0, 23.9.1, 23.9.2
+      - name: v24.3
+      # versions: 1.10.0, 1.10.1, 1.11.0, 1.11.1, 22.9.0, 22.9.1, 22.9.2, 23.3.0, 23.3.1, 23.3.2, 23.6.0, 23.6.1, 23.9.0, 23.9.1, 23.9.2, 24.3.0
+      - name: v24.6
+      # versions: 1.10.0, 1.10.1, 1.11.0, 1.11.1, 22.9.0, 22.9.1, 22.9.2, 23.3.0, 23.3.1, 23.3.2, 23.6.0, 23.6.1, 23.9.0, 23.9.1, 23.9.2, 24.3.0, 24.6.0, 24.6.1, 24.6.2
+      - name: v24.9
+      # versions: 1.10.0, 1.10.1, 1.11.0, 1.11.1, 22.9.0, 22.9.1, 22.9.2, 23.3.0, 23.3.1, 23.3.2, 23.6.0, 23.6.1, 23.9.0, 23.9.1, 23.9.2, 24.3.0, 24.6.0, 24.6.1, 24.6.2, 24.9.0, 24.9.1, 24.9.2
+      - name: v25.3
+      # versions: 1.10.0, 1.10.1, 1.11.0, 1.11.1, 22.9.0, 22.9.1, 22.9.2, 23.3.0, 23.3.1, 23.3.2, 23.6.0, 23.6.1, 23.9.0, 23.9.1, 23.9.2, 24.3.0, 24.6.0, 24.6.1, 24.6.2, 24.9.0, 24.9.1, 24.9.2, 25.3.0, 25.3.1, 25.3.2, 25.3.3, 25.3.4
+      - name: v25.10
+      # versions: 1.10.0, 1.10.1, 1.11.0, 1.11.1, 22.9.0, 22.9.1, 22.9.2, 23.3.0, 23.3.1, 23.3.2, 23.6.0, 23.6.1, 23.9.0, 23.9.1, 23.9.2, 24.3.0, 24.6.0, 24.6.1, 24.6.2, 24.9.0, 24.9.1, 24.9.2, 25.3.0, 25.3.1, 25.3.2, 25.3.3, 25.3.4, 25.10.0, 25.10.1
+      - name: v26.3  # default
+      # versions: 26.3.0, 26.3.1, 26.3.2, 26.3.3
+      defaultChannel: v26.3
+    - name: habana-ai-operator
+      channels:
+      - name: '1.22'
+      # versions: 1.22.1-6-2, 1.22.1-6-3, 1.22.2-32, 1.22.2-32-1, 1.22.2-32-2
+      - name: '1.23'
+      # versions: 1.23.0-695
+      - name: '1.24'
+      # versions: 1.24.0-1007
+      - name: stable  # default
+      # versions: 1.22.1-6-2, 1.22.1-6-3, 1.22.2-32, 1.22.2-32-1, 1.22.2-32-2, 1.23.0-695, 1.24.0-1007
+      defaultChannel: stable
+    - name: hpe-csi-operator
+      channels:
+      - name: stable  # default
+      # versions: 3.0.2, 3.1.0, 3.2.0
+      defaultChannel: stable
+    - name: hspc-operator
+      channels:
+      - name: stable  # default
+      # versions: 1.17.3, 1.18.2, 1.18.3
+      defaultChannel: stable
+    - name: hulft
+      channels:
+      - name: stable  # default
+      # versions: 10.3.0, 10.4.0, 10.5.0, 10.6.0
+      defaultChannel: stable
+    - name: intel-device-plugins-operator
+      channels:
+      - name: alpha
+      # versions: 0.28.0, 0.29.0, 0.29.1, 0.32.1, 0.32.2
+      - name: stable  # default
+      # versions: 0.28.0, 0.29.0, 0.29.1, 0.32.1, 0.32.2, 0.34.1, 0.35.0, 0.36.0
+      defaultChannel: stable
+    - name: k10-kasten-operator-rhmp
+      channels:
+      - name: stable  # default
+      # versions: 6.5.5, 6.5.6, 6.5.8, 6.5.10, 6.5.11, 6.5.12, 6.5.13, 6.5.14, 7.0.1, 7.0.3, 7.0.4, 7.0.5, 7.0.6, 7.0.7, 7.0.8, 7.0.9, 7.0.11, 7.0.12, 7.0.13, 7.0.14, 7.5.0, 7.5.1, 7.5.2, 7.5.3, 7.5.4, 7.5.7, 7.5.8, 7.5.9, 7.5.10, 8.0.0, 8.0.1, 8.0.2, 8.0.3, 8.0.4, 8.0.5, 8.0.6, 8.0.7, 8.0.8, 8.0.9, 8.0.10, 8.0.11, 8.0.13, 8.0.14, 8.0.15, 8.5.0, 8.5.1, 8.5.2, 8.5.3, 8.5.4, 8.5.5, 8.5.6, 8.5.7, 8.5.8, 8.5.9, 8.5.11, 8.5.12, 8.5.13, 9.0.1, 9.0.2
+      defaultChannel: stable
+    - name: k8s-triliovault
+      channels:
+      - name: 3.1.x
+      # versions: 3.1.0, 3.1.1, 3.1.2, 3.1.3
+      - name: 4.0.x
+      # versions: 4.0.0, 4.0.1, 4.0.2, 4.0.3, 4.0.4, 4.0.5
+      - name: 5.0.x
+      # versions: 5.0.0, 5.0.1, 5.0.2, 5.0.3, 5.0.4
+      - name: 5.1.x
+      # versions: 5.1.0, 5.1.1, 5.1.2
+      - name: 5.2.x
+      # versions: 5.2.0
+      - name: 5.3.x  # default
+      # versions: 5.3.0, 5.3.1
+      defaultChannel: 5.3.x
+    - name: kubecost-operator
+      channels:
+      - name: alpha
+      # versions: 2.5.4, 2.7.1, 2.7.2, 2.8.0, 2.8.1, 2.8.2
+      - name: stable  # default
+      # versions: 3.0.0, 3.0.1, 3.0.2, 3.0.3, 3.0.4, 3.0.5, 3.0.6, 3.1.0, 3.1.1, 3.1.2, 3.1.3, 3.1.4, 3.1.5, 3.1.6, 3.1.7, 3.1.8, 3.2.0, 3.2.1
+      defaultChannel: stable
+    - name: kurrentdb-operator
+      channels:
+      - name: stable-v1  # default
+      # versions: 1.4.3, 1.5.0, 1.6.0-0
+      defaultChannel: stable-v1
+    - name: linstor-operator
+      channels:
+      - name: stable-v2  # default
+      # versions: 2.8.1, 2.9.0, 2.9.1, 2.10.1, 2.10.1-0.gbf3c346, 2.10.2, 2.10.3, 2.10.4, 2.10.5, 2.10.6, 2.10.7, 2.10.8, 2.11.0
+      defaultChannel: stable-v2
+    - name: minio-minkms-operator
+      channels:
+      - name: stable  # default
+      # versions: 2025.12.20100920, 2026.2.9031243, 2026.3.18173617, 2026.4.13102716, 2026.7.16235330
+      defaultChannel: stable
+    - name: minio-object-store-operator
+      channels:
+      - name: stable  # default
+      # versions: 2025.5.12190907, 2025.8.19175300, 2025.12.19074437, 2025.12.19091821, 2025.12.20100920, 2026.2.9031243, 2026.3.18173617, 2026.4.13102716, 2026.7.9050221, 2026.7.16235330, 2026.7.21224148
+      defaultChannel: stable
+    - name: nutanixcsioperator
+      channels:
+      - name: stable-3.x  # default
+      # versions: 3.3.4, 3.3.8, 3.3.9, 3.6.0, 3.6.1, 3.7.0, 3.7.1, 3.7.2
+      defaultChannel: stable-3.x
+    - name: nvidia-network-operator
+      channels:
+      - name: stable  # default
+      # versions: 25.7.0, 25.10.0, 26.1.0, 26.4.0, 26.4.1
+      - name: v25.7
+      # versions: 25.7.0
+      - name: v25.10
+      # versions: 25.10.0
+      - name: v26.1
+      # versions: 26.1.0
+      - name: v26.4
+      # versions: 26.4.0, 26.4.1
+      defaultChannel: stable
+    - name: openshift-fusion-access-operator
+      channels:
+      - name: stable-v1  # default
+      # versions: 0.9.3, 1.0.0, 1.0.1, 1.1.0-1, 1.1.1-1, 1.2.0-3
+      defaultChannel: stable-v1
+    - name: operator-certification-operator
+      channels:
+      - name: alpha  # default
+      # versions: 1.6.0
+      defaultChannel: alpha
+    - name: pg4k-pgd
+      channels:
+      - name: candidate
+      # versions: 1.2.0-rc1, 2.0.0-rc1
+      - name: stable  # default
+      # versions: 1.0.1, 1.1.0, 1.1.1, 1.1.2, 1.1.3, 1.2.0, 1.2.1
+      - name: stable-v2
+      # versions: 2.0.0, 2.0.1
+      defaultChannel: stable
+    - name: portworx-certified
+      channels:
+      - name: alpha
+      # versions: 1.6.1, 1.7.1, 1.8.0, 1.8.1, 1.9.0, 1.9.1, 1.10.0, 1.10.1, 1.10.2, 1.10.3, 1.10.4, 1.10.5, 23.3.0, 23.3.1, 23.4.0, 23.5.0, 23.5.1, 23.7.0, 23.10.1, 23.10.2, 23.10.3, 23.10.4, 23.10.5, 24.1.0, 24.1.1, 24.1.2, 24.1.3, 24.2.0, 24.2.1, 24.2.2, 24.2.3, 24.2.4, 25.2.0, 25.2.1, 25.2.2, 25.3.0, 25.3.1, 25.4.0, 25.5.0, 25.5.1, 25.5.2, 25.6.0, 25.6.1, 26.1.0, 26.2.0, 26.2.1, 26.3.0
+      - name: stable  # default
+      # versions: 1.6.1, 1.7.1, 1.8.0, 1.8.1, 1.9.0, 1.9.1, 1.10.0, 1.10.1, 1.10.2, 1.10.3, 1.10.4, 1.10.5, 23.3.0, 23.3.1, 23.4.0, 23.5.0, 23.5.1, 23.7.0, 23.10.1, 23.10.2, 23.10.3, 23.10.4, 23.10.5, 24.1.0, 24.1.1, 24.1.2, 24.1.3, 24.2.0, 24.2.1, 24.2.2, 24.2.3, 24.2.4, 25.2.0, 25.2.1, 25.2.2, 25.3.0, 25.3.1, 25.4.0, 25.5.0, 25.5.1, 25.5.2, 25.6.0, 25.6.1, 26.1.0, 26.2.0, 26.2.1, 26.3.0
+      defaultChannel: stable
+    - name: portworx-multi-cluster-certified
+      channels:
+      - name: stable  # default
+      # versions: 26.1.0
+      defaultChannel: stable
+    - name: rbln-npu-operator
+      channels:
+      - name: candidate
+      # versions: 0.4.0, 0.4.1, 0.4.2, 0.4.3, 0.4.4, 0.4.5
+      - name: fast
+      # versions: 0.4.0, 0.4.1, 0.4.2, 0.4.3, 0.4.4, 0.4.5
+      - name: stable  # default
+      # versions: 0.4.0, 0.4.1, 0.4.2, 0.4.3, 0.4.4, 0.4.5
+      defaultChannel: stable
+    - name: scaleops-operator
+      channels:
+      - name: stable-v1
+      # versions: 1.26.8, 1.26.9, 1.26.10, 1.26.11, 1.26.12, 1.26.13, 1.26.15, 1.26.16, 1.26.17, 1.26.18, 1.26.20, 1.26.21, 1.26.22, 1.26.24, 1.26.25, 1.26.27, 1.26.29, 1.26.30, 1.27.1, 1.27.2, 1.27.3, 1.27.4, 1.27.5, 1.27.6, 1.27.8, 1.27.9, 1.27.10, 1.27.11, 1.27.12, 1.27.13, 1.28.0, 1.28.1, 1.28.3, 1.28.4, 1.28.5, 1.28.7, 1.28.8, 1.28.11, 1.28.12, 1.28.13, 1.28.14, 1.28.15, 1.28.16, 1.29.3, 1.29.4, 1.29.6, 1.29.7, 1.29.8, 1.29.10, 1.29.11, 1.30.0, 1.30.1, 1.30.2, 1.30.3, 1.30.8, 1.30.9, 1.30.10, 1.30.11, 1.30.12, 1.30.13, 1.30.14, 1.30.16, 1.30.17, 1.30.18, 1.30.20, 1.31.1, 1.31.2, 1.31.4, 1.31.5, 1.32.2, 1.32.5, 1.32.6, 1.32.7, 1.32.8, 1.32.13, 1.33.0, 1.33.1, 1.33.2, 1.33.3, 1.33.4, 1.33.5
+      - name: stable-v1.26
+      # versions: 1.26.8, 1.26.9, 1.26.10, 1.26.11, 1.26.12, 1.26.13, 1.26.15, 1.26.16, 1.26.17, 1.26.18, 1.26.20, 1.26.21, 1.26.22, 1.26.24, 1.26.25, 1.26.27, 1.26.29, 1.26.30
+      - name: stable-v1.27
+      # versions: 1.27.1, 1.27.2, 1.27.3, 1.27.4, 1.27.5, 1.27.6, 1.27.8, 1.27.9, 1.27.10, 1.27.11, 1.27.12, 1.27.13
+      - name: stable-v1.28
+      # versions: 1.28.0, 1.28.1, 1.28.3, 1.28.4, 1.28.5, 1.28.7, 1.28.8, 1.28.11, 1.28.12, 1.28.13, 1.28.14, 1.28.15, 1.28.16
+      - name: stable-v1.29
+      # versions: 1.29.3, 1.29.4, 1.29.6, 1.29.7, 1.29.8, 1.29.10, 1.29.11
+      - name: stable-v1.30
+      # versions: 1.30.0, 1.30.1, 1.30.2, 1.30.3, 1.30.8, 1.30.9, 1.30.10, 1.30.11, 1.30.12, 1.30.13, 1.30.14, 1.30.16, 1.30.17, 1.30.18, 1.30.20
+      - name: stable-v1.31
+      # versions: 1.31.1, 1.31.2, 1.31.4, 1.31.5
+      - name: stable-v1.32
+      # versions: 1.32.2, 1.32.5, 1.32.6, 1.32.7, 1.32.8, 1.32.13
+      - name: stable-v1.33  # default
+      # versions: 1.33.0, 1.33.1, 1.33.2, 1.33.3, 1.33.4, 1.33.5
+      defaultChannel: stable-v1.33
+    - name: stackable-airflow-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-commons-operator
+      channels:
+      - name: '25.3'
+      # versions: 26.3.0
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-druid-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-hbase-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-hdfs-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-hive-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-kafka-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-listener-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-nifi-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-opa-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-opensearch-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-secret-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-spark-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-superset-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-trino-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackable-zookeeper-operator
+      channels:
+      - name: '25.11'
+      # versions: 25.11.0
+      - name: '26.3'
+      # versions: 26.3.0
+      - name: '26.7'
+      # versions: 26.7.0
+      - name: stable  # default
+      # versions: 25.11.0, 26.3.0, 26.7.0
+      defaultChannel: stable
+    - name: stackgres-certified
+      channels:
+      - name: candidate
+      # versions: 1.18.1, 1.18.2, 1.18.3, 1.18.4, 1.18.5, 1.18.6, 1.18.7, 1.18.8, 1.19.0, 1.19.0-rc1, 1.19.0-rc2, 1.19.0-rc3, 1.19.0-rc4, 1.19.0-rc5
+      - name: fast
+      # versions: 1.18.1, 1.18.2, 1.18.3, 1.18.4, 1.18.5, 1.18.6, 1.18.7, 1.18.8, 1.19.0, 1.19.0-rc2, 1.19.0-rc3, 1.19.0-rc4, 1.19.0-rc5
+      - name: stable  # default
+      # versions: 1.18.1, 1.18.2, 1.18.3, 1.18.4, 1.18.5, 1.18.6, 1.18.7, 1.18.8, 1.19.0
+      defaultChannel: stable
+    - name: strategy-operator
+      channels:
+      - name: stable-v1  # default
+      # versions: 26.5.6, 26.7.1
+      defaultChannel: stable-v1
+    - name: tigera-operator
+      channels:
+      - name: release-v1.40
+      # versions: 1.40.2, 1.40.4
+      - name: release-v1.42  # default
+      # versions: 1.42.0
+      defaultChannel: release-v1.42
+    - name: trident-operator
+      channels:
+      - name: stable  # default
+      # versions: 25.10.0, 25.10.0-linux-only, 26.2.0, 26.2.1, 26.6.0
+      defaultChannel: stable
+    - name: victoriametrics-operator
+      channels:
+      - name: beta  # default
+      # versions: 0.68.2, 0.68.3, 0.68.4, 0.70.1, 0.73.1, 0.74.0, 0.74.1
+      - name: stable
+      # versions: 0.68.5
+      defaultChannel: beta
+    - name: visionone-containersecurity
+      channels:
+      - name: alpha
+      # versions: 3.3.9, 3.3.9-operator.1, 3.3.9-operator.2, 3.4.0, 3.4.1, 3.4.2, 3.5.0, 3.5.1
+      - name: stable  # default
+      # versions: 3.3.9, 3.3.9-operator.1, 3.3.9-operator.2, 3.4.0, 3.4.1, 3.4.2, 3.5.0, 3.5.1
+      defaultChannel: stable
+    - name: xspc-operator
+      channels:
+      - name: stable  # default
+      # versions: 1.16.1, 1.17.3, 1.18.1
+      defaultChannel: stable

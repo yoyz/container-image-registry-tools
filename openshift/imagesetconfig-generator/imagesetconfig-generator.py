@@ -12,7 +12,7 @@ import signal
 import time
 
 # --- Global Configuration ---
-VERSION = "0.14"
+VERSION = "0.1.8"
 
 # TODO:
 # 1. [FIXED] write_image_set_config: the '# default' comment (and _default stripping)
@@ -20,14 +20,13 @@ VERSION = "0.14"
 #    package whose name is a prefix of another, like amq-streams vs amq-streams-console).
 #    Now uses exact name matching via regex + op_defaults dict. Also fixed YAML-quoted
 #    channel names (e.g. '3.15') breaking lookups.
-# 2. [DOC] README example output (line ~132) shows '_default: release-2.10  # default',
-#    but the code strips '_default:' lines and only appends '  # default' as a comment.
-# 3. [REFACTOR] write_image_set_config: pkg_entry['_default'] is stored on every entry
-#    regardless of version, then only used for comment annotation. Compute the '# default'
-#    marker directly instead.
-# 4. [BUG] handle_extract does not pass '--tls-verify' to 'podman create/cp', so the
-#    TLS toggle only affects the pull step. Also handle_fetch uses 'podman search' as an
-#    extra network call for auth verification.
+# 2. [DONE] README example output now matches reality (no '_default:' lines; the
+#    '# default' annotation is appended as a trailing comment).
+# 3. [DONE] write_image_set_config no longer stores the '_default' intermediate on
+#    every entry; the default-channel marker is computed directly via op_defaults.
+# 4. [DONE] handle_extract now forwards '--tls-verify' to 'podman create'.
+#    handle_fetch no longer uses 'podman search' as an auth pre-check; the pull
+#    itself surfaces auth errors and prints a 'podman login' hint on failure.
 
 # --- Helper Utilities ---
 
@@ -63,22 +62,44 @@ def str2bool(v):
     elif v.lower() in ('no', 'false', 'f', 'n', '0'): return False
     else: raise argparse.ArgumentTypeError('Boolean value expected.')
 
-# --- Core Functional Blocks ---
+def _check_output_writable(output_file):
+    """Fail fast if the output file cannot be written, before doing real work.
 
-def handle_fetch(catalog, tls_verify, timeout, disable_sig):
-    """Checks auth and pulls the catalog image via podman."""
-    registry = catalog.split('/')[0]
-    print(f"--- Verifying authentication for {registry} ---")
-    
-    auth_cmd = ['podman', 'search', '--limit', '1', f'--tls-verify={str(tls_verify).lower()}', catalog]
-    if subprocess.run(auth_cmd, capture_output=True).returncode != 0:
-        print(f"\n[!] ERROR: Authentication failed. Please run: podman login {registry}")
+    Opens the file for append (creates it if missing); the real write later
+    overwrites it with 'w'. Exits with a clear error instead of a traceback
+    partway through fetch/extract/generate.
+    """
+    try:
+        with open(output_file, 'a'):
+            pass
+    except OSError as e:
+        print(f"\n[!] ERROR: Cannot write output file {output_file}: {e}")
+        print("    Check the path is a writable location (e.g. your home or /tmp).")
         sys.exit(1)
 
+# --- Core Functional Blocks ---
+
+def _image_exists_locally(catalog):
+    """True if the catalog image reference is already present in podman."""
+    try:
+        out = subprocess.run(['podman', 'images', '--format', '{{.Repository}}:{{.Tag}}'],
+                             capture_output=True, text=True, check=True)
+        return catalog in out.stdout.splitlines()
+    except Exception:
+        return False
+
+def handle_fetch(catalog, tls_verify, timeout, disable_sig):
+    """Pulls the catalog image via podman.
+
+    Auth failures surface directly from the pull (no separate `podman search`
+    pre-check — that was a poor auth probe that passed for registries where
+    search is anonymous but pull requires credentials).
+    """
+    registry = catalog.split('/')[0]
     print(f"--- Fetching {catalog} (Timeout: {timeout}s) ---")
     signal.signal(signal.SIGALRM, timeout_handler)
     signal.alarm(timeout)
-    
+
     tmp_policy = None
     try:
         pull_cmd = ['podman', 'pull', f'--tls-verify={str(tls_verify).lower()}', catalog]
@@ -88,25 +109,90 @@ def handle_fetch(catalog, tls_verify, timeout, disable_sig):
             with open(tmp_policy, 'w') as f:
                 json.dump({"default": [{"type": "insecureAcceptAnything"}]}, f)
             pull_cmd.extend(['--signature-policy', tmp_policy])
-        
-        subprocess.run(pull_cmd, check=True)
+
+        try:
+            subprocess.run(pull_cmd, check=True)
+        except subprocess.CalledProcessError:
+            print(f"\n[!] ERROR: Podman failed to pull {catalog}.")
+            print(f"    If the registry requires credentials, run: podman login {registry}")
+            if _image_exists_locally(catalog):
+                print(f"    The image {catalog} is already present in 'podman images';")
+                print(f"    re-run without --fetch to use the local copy.")
+            sys.exit(1)
     finally:
         signal.alarm(0)
         if tmp_policy and os.path.exists(tmp_policy):
             os.remove(tmp_policy)
 
-def handle_extract(catalog, dest_path):
+def handle_extract(catalog, dest_path, tls_verify=True):
     """Creates temporary container to 'cp' the /configs directory out."""
     container_id = None
     try:
         print(f"--- Extracting /configs to {dest_path} ---")
-        container_id = subprocess.run(['podman', 'create', catalog], capture_output=True, text=True, check=True).stdout.strip()
+        create_cmd = ['podman', 'create', f'--tls-verify={str(tls_verify).lower()}', catalog]
+        container_id = subprocess.run(create_cmd, capture_output=True, text=True, check=True).stdout.strip()
         if os.path.exists(dest_path): shutil.rmtree(dest_path)
         os.makedirs(dest_path)
         subprocess.run(['podman', 'cp', f"{container_id}:/configs/.", dest_path], check=True)
     finally:
         if container_id:
             subprocess.run(['podman', 'rm', '-f', container_id], capture_output=True)
+
+def _make_pkg_entry():
+    """Factory for the per-package data structure."""
+    return {"channels": set(), "default": None, "versions": {}}
+
+def _select_parser(filename):
+    """Return a parser for an FBC file (by extension), or None if not a target."""
+    if filename.endswith('.json'):
+        return lambda f: extract_json_objects(f.read())
+    elif filename.endswith(('.yaml', '.yml')):
+        return lambda f: yaml.safe_load_all(f)
+    return None
+
+def _handle_doc(doc, pkg_map, bundle_versions, verbose):
+    """Dispatch a single FBC document to the right schema handler."""
+    if doc.get('schema') == 'olm.package':
+        name = doc.get('name')
+        if name:
+            if name not in pkg_map: pkg_map[name] = _make_pkg_entry()
+            pkg_map[name]["default"] = doc.get('defaultChannel')
+            if not verbose:
+                print(f"{'PACKAGE':<12} | {name:<35} | Default: {doc.get('defaultChannel')}")
+    elif doc.get('schema') == 'olm.channel':
+        pkg = doc.get('package')
+        chan = doc.get('name')
+        if pkg and chan:
+            if pkg not in pkg_map: pkg_map[pkg] = _make_pkg_entry()
+            if chan not in pkg_map[pkg]["channels"]:
+                pkg_map[pkg]["channels"].add(chan)
+                pkg_map[pkg]["versions"][chan] = []
+                if not verbose:
+                    print(f"{'CHANNEL':<12} | {pkg:<35} | -> {chan}")
+            for entry in (doc.get('entries') or []):
+                ename = entry.get('name')
+                if ename and ename not in pkg_map[pkg]["versions"][chan]:
+                    pkg_map[pkg]["versions"][chan].append(ename)
+    elif doc.get('schema') == 'olm.bundle':
+        name = doc.get('name')
+        if name:
+            for prop in (doc.get('properties') or []):
+                if prop.get('type') == 'olm.package':
+                    bundle_versions[name] = prop.get('value', {}).get('version')
+                    break
+
+def _resolve_versions(pkg_map, bundle_versions):
+    """Map channel entry names to bundle versions, naturally sorted."""
+    for pkg in pkg_map:
+        for chan in pkg_map[pkg]["versions"]:
+            versions = set()
+            for ename in pkg_map[pkg]["versions"][chan]:
+                v = bundle_versions.get(ename)
+                if not v:
+                    m = re.search(r'\.v([0-9][^/]*)$', ename)
+                    v = m.group(1) if m else ename
+                if v: versions.add(v)
+            pkg_map[pkg]["versions"][chan] = sorted(versions, key=natural_sort_key)
 
 def handle_parse_fbc(config_dir, verbose=False):
     """Walks the config directory and builds a map of packages and channels.
@@ -121,75 +207,22 @@ def handle_parse_fbc(config_dir, verbose=False):
     print("-" * 80)
     for root, _, files in os.walk(config_dir):
         for file in files:
-            file_path = os.path.join(root, file)
-            parser = None
-            
-            # Identify target files
-            is_target = file.endswith(('.json', '.yaml', '.yml'))
-            
-            if verbose and is_target:
-                print(f"Reading {file_path} ...", end='', flush=True)
+            parser = _select_parser(file)
+            if not parser:
+                continue
+            if verbose:
+                print(f"Reading {os.path.join(root, file)} ...", end='', flush=True)
+                print(" OK")
+            try:
+                with open(os.path.join(root, file), 'r') as f:
+                    for doc in parser(f):
+                        if isinstance(doc, dict):
+                            _handle_doc(doc, pkg_map, bundle_versions, verbose)
+            except Exception as e:
+                if verbose: print(f" FAIL ({e})")
+                else: print(f"Warning: Could not parse {file}: {e}")
 
-            # Select parser based on file extension
-            if file.endswith('.json'):
-                parser = lambda f: extract_json_objects(f.read())
-            elif file.endswith(('.yaml', '.yml')):
-                parser = lambda f: yaml.safe_load_all(f)
-            
-            if parser:
-                if verbose:
-                    print(" OK")
-                try:
-                    with open(file_path, 'r') as f:
-                        for doc in parser(f):
-                            if not isinstance(doc, dict): continue
-                            if doc.get('schema') == 'olm.package':
-                                name = doc.get('name')
-                                if name:
-                                    if name not in pkg_map: pkg_map[name] = {"channels": set(), "default": None, "versions": {}}
-                                    pkg_map[name]["default"] = doc.get('defaultChannel')
-                                    if not verbose:
-                                        print(f"{'PACKAGE':<12} | {name:<35} | Default: {doc.get('defaultChannel')}")
-                            elif doc.get('schema') == 'olm.channel':
-                                pkg = doc.get('package')
-                                chan = doc.get('name')
-                                if pkg and chan:
-                                    if pkg not in pkg_map: pkg_map[pkg] = {"channels": set(), "default": None, "versions": {}}
-                                    if chan not in pkg_map[pkg]["channels"]:
-                                        pkg_map[pkg]["channels"].add(chan)
-                                        pkg_map[pkg]["versions"][chan] = []
-                                        if not verbose:
-                                            print(f"{'CHANNEL':<12} | {pkg:<35} | -> {chan}")
-                                    for entry in (doc.get('entries') or []):
-                                        ename = entry.get('name')
-                                        if ename and ename not in pkg_map[pkg]["versions"][chan]:
-                                            pkg_map[pkg]["versions"][chan].append(ename)
-                            elif doc.get('schema') == 'olm.bundle':
-                                name = doc.get('name')
-                                if name:
-                                    for prop in (doc.get('properties') or []):
-                                        if prop.get('type') == 'olm.package':
-                                            bundle_versions[name] = prop.get('value', {}).get('version')
-                                            break
-                except Exception as e:
-                    if verbose: print(f" FAIL ({e})")
-                    else: print(f"Warning: Could not parse {file}: {e}")
-            elif verbose and is_target:
-                # Should not happen given is_target logic, but good for safety
-                print(" SKIP (No Parser)")
-
-    # Resolve channel entry names to versions, sorted naturally
-    for pkg in pkg_map:
-        for chan in pkg_map[pkg]["versions"]:
-            versions = set()
-            for ename in pkg_map[pkg]["versions"][chan]:
-                v = bundle_versions.get(ename)
-                if not v:
-                    m = re.search(r'\.v([0-9][^/]*)$', ename)
-                    v = m.group(1) if m else ename
-                if v: versions.add(v)
-            pkg_map[pkg]["versions"][chan] = sorted(versions, key=natural_sort_key)
-
+    _resolve_versions(pkg_map, bundle_versions)
     return pkg_map
 
 def write_image_set_config(output_file, catalog, pkg_map, version='v1', version_comments=False, min_max_version=False):
@@ -201,6 +234,7 @@ def write_image_set_config(output_file, catalog, pkg_map, version='v1', version_
     (first/last of the channel's sorted versions) instead of the comment.
     """
     op_list = []
+    op_defaults = {}
     for pkg in sorted(pkg_map.keys()):
         data = pkg_map[pkg]
         sorted_chans = sorted(list(data["channels"]), key=natural_sort_key)
@@ -221,7 +255,7 @@ def write_image_set_config(output_file, catalog, pkg_map, version='v1', version_
 
         pkg_entry = {"name": pkg, "channels": channels}
         if version == 'v2': pkg_entry["defaultChannel"] = actual_default
-        pkg_entry["_default"] = actual_default
+        op_defaults[pkg] = actual_default
         op_list.append(pkg_entry)
 
     api_version = "mirror.openshift.io/v2alpha1" if version == 'v2' else "mirror.openshift.io/v1alpha2"
@@ -229,7 +263,6 @@ def write_image_set_config(output_file, catalog, pkg_map, version='v1', version_
     raw_yaml = yaml.dump(config, default_flow_style=False, sort_keys=False)
 
     final_lines = []
-    op_defaults = {p['name']: p['_default'] for p in op_list}
     current_pkg = None
     current_default = None
     for line in raw_yaml.splitlines():
@@ -244,7 +277,7 @@ def write_image_set_config(output_file, catalog, pkg_map, version='v1', version_
             chan = chan_line.group(1).strip().strip("'\"")
             if current_default and chan == current_default:
                 line = line.rstrip() + "  # default"
-        if "_default:" not in line: final_lines.append(line)
+        final_lines.append(line)
         if version_comments and current_pkg and chan_line:
             versions = pkg_map[current_pkg].get("versions", {}).get(chan)
             if versions:
@@ -258,8 +291,8 @@ def write_image_set_config(output_file, catalog, pkg_map, version='v1', version_
 def main():
     usage_examples = """
 Examples of usage:
-  1. Full automated run for oc-mirror v2 (Red Hat v4.16):
-     ./imagesetconfig-generator.py -c registry.redhat.io/redhat/redhat-operator-index:v4.16 --fetch --extract --generate myset --v2
+  1. Full automated run for oc-mirror v2 (Red Hat v4.20):
+     ./imagesetconfig-generator.py -c registry.redhat.io/redhat/redhat-operator-index:v4.20 --fetch --extract --generate myset --v2
 
   2. Handle GPG signature failures on RHEL bastion:
      ./imagesetconfig-generator.py -c registry.redhat.io/... --fetch --tls-verify false --disable-signature-policy
@@ -283,7 +316,7 @@ Examples of usage:
     parser.add_argument('--generate', help='Output filename (e.g., config.yaml)')
     parser.add_argument('--timeout', type=int, default=600, help='Timeout for podman pull (default: 600s)')
     parser.add_argument('--tls-verify', type=str2bool, default=True, help='Toggle TLS verification (true/false)')
-    parser.add_argument('--disable-signature-policy', action='store_true', help='Bypass GPG signature checks')
+    parser.add_argument('--disable-signature-policy', action='store_true', help='Bypass GPG signature verification (only when you trust the registry and the Red Hat GPG key is missing from the trust store)')
     parser.add_argument('--version-comment', action='store_true', help='Add available versions as a comment below each channel')
     parser.add_argument('--min-max-version', action='store_true', help='Add minVersion/maxVersion keys per channel (can be combined with --version-comment)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging of file processing')
@@ -303,11 +336,16 @@ Examples of usage:
 
     config_path = args.configs if args.configs else os.path.join('/tmp', get_safe_dirname(args.catalog))
 
+    output_file = None
+    if args.generate:
+        output_file = args.generate if args.generate.endswith('.yaml') else args.generate + '.yaml'
+        _check_output_writable(output_file)
+
     if args.fetch:
         handle_fetch(args.catalog, args.tls_verify, args.timeout, args.disable_signature_policy)
 
     if args.extract:
-        handle_extract(args.catalog, config_path)
+        handle_extract(args.catalog, config_path, tls_verify=args.tls_verify)
 
     if args.generate:
         if not os.path.exists(config_path):
@@ -316,8 +354,7 @@ Examples of usage:
         
         mirror_version = 'v2' if args.v2 else 'v1'
         pkg_map = handle_parse_fbc(config_path, verbose=args.verbose)
-        write_image_set_config(args.generate if args.generate.endswith('.yaml') else args.generate + '.yaml', 
-                               args.catalog, pkg_map, version=mirror_version,
+        write_image_set_config(output_file, args.catalog, pkg_map, version=mirror_version,
                                version_comments=args.version_comment,
                                min_max_version=args.min_max_version)
 

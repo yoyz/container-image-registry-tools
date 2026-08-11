@@ -1,0 +1,209 @@
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+mirror:
+  operators:
+  - catalog: example.com/operators/real-catalog:v1
+    packages:
+    - name: alloydb-omni-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: apicurio-registry-3
+      channels:
+      - name: 3.2.x
+      - name: 3.3.x
+      - name: 3.x  # default
+      defaultChannel: 3.x
+    - name: aws-neuron-operator
+      channels:
+      - name: Fast  # default
+      - name: Stable
+      defaultChannel: Fast
+    - name: cat-facts-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: clusterpulse
+      channels:
+      - name: fast-v0
+      - name: fast-v1  # default
+      defaultChannel: fast-v1
+    - name: coherence-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: dell-csm-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: dotvirt-operator
+      channels:
+      - name: stable-v0  # default
+      defaultChannel: stable-v0
+    - name: ecr-secret-operator
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: hive-operator
+      channels:
+      - name: alpha  # default
+      - name: mce-2.0
+      - name: ocm-2.3
+      - name: ocm-2.4
+      defaultChannel: alpha
+    - name: infinispan
+      channels:
+      - name: 2.2.x
+      - name: 2.3.x
+      - name: 2.4.x
+      - name: stable  # default
+      defaultChannel: stable
+    - name: jumpstarter-operator
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: kairos-operator
+      channels:
+      - name: candidate-v2  # default
+      defaultChannel: candidate-v2
+    - name: kepler-operator
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: koku-metrics-operator
+      channels:
+      - name: alpha
+      - name: beta  # default
+      defaultChannel: beta
+    - name: konflux-operator
+      channels:
+      - name: candidate-v0.0
+      - name: candidate-v0.1
+      - name: candidate-v0.2
+      - name: stable-v0.0
+      - name: stable-v0.1
+      - name: stable-v0.2  # default
+      defaultChannel: stable-v0.2
+    - name: kube-green
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: kubernaut-operator
+      channels:
+      - name: candidate-v1  # default
+      defaultChannel: candidate-v1
+    - name: kubevirt-wol
+      channels:
+      - name: candidate-v0
+      - name: fast-v0
+      - name: stable-v0  # default
+      defaultChannel: stable-v0
+    - name: layer7-operator
+      channels:
+      - name: preview  # default
+      defaultChannel: preview
+    - name: libredb-studio-operator
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: multi-nic-cni-operator
+      channels:
+      - name: alpha
+      - name: beta
+      - name: stable  # default
+      defaultChannel: stable
+    - name: multicluster-global-hub-operator
+      channels:
+      - name: release-1.6
+      - name: release-1.7  # default
+      defaultChannel: release-1.7
+    - name: nfs-provisioner-operator
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: opendatahub-operator
+      channels:
+      - name: fast
+      - name: fast-3  # default
+      - name: odh-2.8.z
+      - name: rolling
+      - name: stable
+      defaultChannel: fast-3
+    - name: openshift-integration-operator
+      channels:
+      - name: candidate-v0  # default
+      defaultChannel: candidate-v0
+    - name: patterns-operator
+      channels:
+      - name: fast  # default
+      defaultChannel: fast
+    - name: project-onboarding-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: project-quay
+      channels:
+      - name: stable-3.6
+      - name: stable-3.7
+      - name: stable-3.8
+      - name: stable-3.9
+      - name: stable-3.10
+      - name: stable-3.11
+      - name: stable-3.12
+      - name: stable-3.13
+      - name: stable-3.14
+      - name: stable-3.15
+      - name: stable-3.16
+      - name: stable-3.17  # default
+      defaultChannel: stable-3.17
+    - name: rabbitmq-cluster-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: rabbitmq-messaging-topology-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: rsct-operator
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: sailoperator
+      channels:
+      - name: 1.30-nightly
+      - name: 1.31-nightly
+      - name: candidates
+      - name: stable  # default
+      - name: stable-1.0
+      - name: stable-1.25
+      - name: stable-1.26
+      - name: stable-1.27
+      - name: stable-1.28
+      - name: stable-1.29
+      - name: stable-1.30
+      defaultChannel: stable
+    - name: slurm-operator
+      channels:
+      - name: alpha
+      - name: release-1.0  # default
+      defaultChannel: release-1.0
+    - name: stackgres-community
+      channels:
+      - name: candidate
+      - name: fast
+      - name: stable  # default
+      defaultChannel: stable
+    - name: trident-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: victoriametrics-operator
+      channels:
+      - name: beta  # default
+      - name: stable
+      defaultChannel: beta
+    - name: visionone-containersecurity
+      channels:
+      - name: alpha
+      - name: stable  # default
+      defaultChannel: stable

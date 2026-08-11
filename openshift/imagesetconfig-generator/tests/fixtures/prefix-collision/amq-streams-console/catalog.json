@@ -1,0 +1,28 @@
+{
+  "schema": "olm.package",
+  "name": "amq-streams-console",
+  "defaultChannel": "alpha"
+}
+{
+  "schema": "olm.channel",
+  "package": "amq-streams-console",
+  "name": "alpha",
+  "entries": [
+    { "name": "amq-streams-console.v1.0.0" },
+    { "name": "amq-streams-console.v1.1.0", "replaces": "amq-streams-console.v1.0.0" }
+  ]
+}
+{
+  "schema": "olm.bundle",
+  "name": "amq-streams-console.v1.0.0",
+  "properties": [
+    { "type": "olm.package", "value": { "packageName": "amq-streams-console", "version": "1.0.0" } }
+  ]
+}
+{
+  "schema": "olm.bundle",
+  "name": "amq-streams-console.v1.1.0",
+  "properties": [
+    { "type": "olm.package", "value": { "packageName": "amq-streams-console", "version": "1.1.0" } }
+  ]
+}

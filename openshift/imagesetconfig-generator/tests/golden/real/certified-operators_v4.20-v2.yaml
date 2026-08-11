@@ -1,0 +1,367 @@
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+mirror:
+  operators:
+  - catalog: example.com/operators/real-catalog:v1
+    packages:
+    - name: airlock-microgateway
+      channels:
+      - name: '4.8'
+      - name: '5.0'
+      - name: '5.1'  # default
+      - name: stable
+      defaultChannel: '5.1'
+    - name: alloydb-omni-operator-certified
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: amd-gpu-operator
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: appian-operator
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: clife
+      channels:
+      - name: '1.16'
+      - name: '1.17'
+      - name: '1.18'
+      - name: '1.19'  # default
+      defaultChannel: '1.19'
+    - name: cloud-native-postgresql
+      channels:
+      - name: candidate
+      - name: fast  # default
+      - name: stable
+      - name: stable-v1.25
+      - name: stable-v1.26
+      - name: stable-v1.27
+      - name: stable-v1.28
+      - name: stable-v1.29
+      - name: stable-v1.30
+      defaultChannel: fast
+    - name: cloudnative-pg
+      channels:
+      - name: candidate
+      - name: stable-v1  # default
+      defaultChannel: stable-v1
+    - name: couchbase-enterprise-certified
+      channels:
+      - name: 2.7.0
+      - name: 2.7.1
+      - name: 2.8.0
+      - name: 2.8.1
+      - name: 2.8.2
+      - name: 2.9.0
+      - name: 2.9.1
+      - name: 2.9.2
+      - name: stable  # default
+      defaultChannel: stable
+    - name: crunchy-postgres-operator
+      channels:
+      - name: v5  # default
+      defaultChannel: v5
+    - name: dell-csm-operator-certified
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: dxoperator
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: dxoperator-v2
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: eda-k8s-operator
+      channels:
+      - name: '6.0'  # default
+      - name: stable
+      defaultChannel: '6.0'
+    - name: edb-hcp-operator
+      channels:
+      - name: alpha
+      - name: innovation
+      - name: lts-v1.3
+      - name: stable  # default
+      defaultChannel: stable
+    - name: f5-ai-security-operator
+      channels:
+      - name: alpha
+      - name: release-testing
+      - name: stable  # default
+      defaultChannel: stable
+    - name: gpu-operator-certified
+      channels:
+      - name: stable
+      - name: v1.10
+      - name: v1.11
+      - name: v22.9
+      - name: v23.3
+      - name: v23.6
+      - name: v23.9
+      - name: v24.3
+      - name: v24.6
+      - name: v24.9
+      - name: v25.3
+      - name: v25.10
+      - name: v26.3  # default
+      defaultChannel: v26.3
+    - name: habana-ai-operator
+      channels:
+      - name: '1.22'
+      - name: '1.23'
+      - name: '1.24'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: hpe-csi-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: hspc-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: hulft
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: intel-device-plugins-operator
+      channels:
+      - name: alpha
+      - name: stable  # default
+      defaultChannel: stable
+    - name: k10-kasten-operator-rhmp
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: k8s-triliovault
+      channels:
+      - name: 3.1.x
+      - name: 4.0.x
+      - name: 5.0.x
+      - name: 5.1.x
+      - name: 5.2.x
+      - name: 5.3.x  # default
+      defaultChannel: 5.3.x
+    - name: kubecost-operator
+      channels:
+      - name: alpha
+      - name: stable  # default
+      defaultChannel: stable
+    - name: kurrentdb-operator
+      channels:
+      - name: stable-v1  # default
+      defaultChannel: stable-v1
+    - name: linstor-operator
+      channels:
+      - name: stable-v2  # default
+      defaultChannel: stable-v2
+    - name: minio-minkms-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: minio-object-store-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: nutanixcsioperator
+      channels:
+      - name: stable-3.x  # default
+      defaultChannel: stable-3.x
+    - name: nvidia-network-operator
+      channels:
+      - name: stable  # default
+      - name: v25.7
+      - name: v25.10
+      - name: v26.1
+      - name: v26.4
+      defaultChannel: stable
+    - name: openshift-fusion-access-operator
+      channels:
+      - name: stable-v1  # default
+      defaultChannel: stable-v1
+    - name: operator-certification-operator
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: pg4k-pgd
+      channels:
+      - name: candidate
+      - name: stable  # default
+      - name: stable-v2
+      defaultChannel: stable
+    - name: portworx-certified
+      channels:
+      - name: alpha
+      - name: stable  # default
+      defaultChannel: stable
+    - name: portworx-multi-cluster-certified
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: rbln-npu-operator
+      channels:
+      - name: candidate
+      - name: fast
+      - name: stable  # default
+      defaultChannel: stable
+    - name: scaleops-operator
+      channels:
+      - name: stable-v1
+      - name: stable-v1.26
+      - name: stable-v1.27
+      - name: stable-v1.28
+      - name: stable-v1.29
+      - name: stable-v1.30
+      - name: stable-v1.31
+      - name: stable-v1.32
+      - name: stable-v1.33  # default
+      defaultChannel: stable-v1.33
+    - name: stackable-airflow-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-commons-operator
+      channels:
+      - name: '25.3'
+      - name: '25.11'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-druid-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-hbase-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-hdfs-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-hive-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-kafka-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-listener-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-nifi-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-opa-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-opensearch-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-secret-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-spark-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-superset-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-trino-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackable-zookeeper-operator
+      channels:
+      - name: '25.11'
+      - name: '26.3'
+      - name: '26.7'
+      - name: stable  # default
+      defaultChannel: stable
+    - name: stackgres-certified
+      channels:
+      - name: candidate
+      - name: fast
+      - name: stable  # default
+      defaultChannel: stable
+    - name: strategy-operator
+      channels:
+      - name: stable-v1  # default
+      defaultChannel: stable-v1
+    - name: tigera-operator
+      channels:
+      - name: release-v1.40
+      - name: release-v1.42  # default
+      defaultChannel: release-v1.42
+    - name: trident-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: victoriametrics-operator
+      channels:
+      - name: beta  # default
+      - name: stable
+      defaultChannel: beta
+    - name: visionone-containersecurity
+      channels:
+      - name: alpha
+      - name: stable  # default
+      defaultChannel: stable
+    - name: xspc-operator
+      channels:
+      - name: stable  # default
+      defaultChannel: stable

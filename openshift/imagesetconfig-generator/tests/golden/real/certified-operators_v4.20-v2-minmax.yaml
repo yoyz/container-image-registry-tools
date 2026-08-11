@@ -1,0 +1,729 @@
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+mirror:
+  operators:
+  - catalog: example.com/operators/real-catalog:v1
+    packages:
+    - name: airlock-microgateway
+      channels:
+      - name: '4.8'
+        minVersion: 4.8.0
+        maxVersion: 4.8.11
+      - name: '5.0'
+        minVersion: 5.0.0
+        maxVersion: 5.0.7
+      - name: '5.1'  # default
+        minVersion: 5.1.1
+        maxVersion: 5.1.4
+      - name: stable
+        minVersion: 4.8.0
+        maxVersion: 5.1.4
+      defaultChannel: '5.1'
+    - name: alloydb-omni-operator-certified
+      channels:
+      - name: stable  # default
+        minVersion: 1.7.0
+        maxVersion: 1.8.0
+      defaultChannel: stable
+    - name: amd-gpu-operator
+      channels:
+      - name: alpha  # default
+        minVersion: 1.1.1
+        maxVersion: 1.5.2
+      defaultChannel: alpha
+    - name: appian-operator
+      channels:
+      - name: alpha  # default
+        minVersion: 0.171.0
+        maxVersion: 0.205.0
+      defaultChannel: alpha
+    - name: clife
+      channels:
+      - name: '1.16'
+        minVersion: 1.16.17-cee.1
+        maxVersion: 1.16.23-cee.1
+      - name: '1.17'
+        minVersion: 0.0.1
+        maxVersion: 1.17.17-cee.1
+      - name: '1.18'
+        minVersion: 1.18.4-cee.1
+        maxVersion: 1.18.11-cee.1
+      - name: '1.19'  # default
+        minVersion: 1.19.5-cee.1
+        maxVersion: 1.19.5-cee.1
+      defaultChannel: '1.19'
+    - name: cloud-native-postgresql
+      channels:
+      - name: candidate
+        minVersion: 1.26.0-rc1
+        maxVersion: 1.30.0-rc1
+      - name: fast  # default
+        minVersion: 1.25.0
+        maxVersion: 1.30.0
+      - name: stable
+        minVersion: 1.25.0
+        maxVersion: 1.29.0
+      - name: stable-v1.25
+        minVersion: 1.25.0
+        maxVersion: 1.25.9
+      - name: stable-v1.26
+        minVersion: 1.26.0
+        maxVersion: 1.26.3
+      - name: stable-v1.27
+        minVersion: 1.27.0
+        maxVersion: 1.27.4
+      - name: stable-v1.28
+        minVersion: 1.28.0
+        maxVersion: 1.28.4
+      - name: stable-v1.29
+        minVersion: 1.29.0
+        maxVersion: 1.29.2
+      - name: stable-v1.30
+        minVersion: 1.30.0
+        maxVersion: 1.30.0
+      defaultChannel: fast
+    - name: cloudnative-pg
+      channels:
+      - name: candidate
+        minVersion: 1.26.0-rc1
+        maxVersion: 1.30.0-rc1
+      - name: stable-v1  # default
+        minVersion: 1.23.1
+        maxVersion: 1.30.0
+      defaultChannel: stable-v1
+    - name: couchbase-enterprise-certified
+      channels:
+      - name: 2.7.0
+        minVersion: 2.7.0-5
+        maxVersion: 2.7.0-5
+      - name: 2.7.1
+        minVersion: 2.7.1-1
+        maxVersion: 2.7.1-1
+      - name: 2.8.0
+        minVersion: 2.8.0-1
+        maxVersion: 2.8.0-2
+      - name: 2.8.1
+        minVersion: 2.8.1-1
+        maxVersion: 2.8.1-2
+      - name: 2.8.2
+        minVersion: 2.8.2-1
+        maxVersion: 2.8.2-1
+      - name: 2.9.0
+        minVersion: 2.9.0-1
+        maxVersion: 2.9.0-3
+      - name: 2.9.1
+        minVersion: 2.9.1-1
+        maxVersion: 2.9.1-1
+      - name: 2.9.2
+        minVersion: 2.9.2-2
+        maxVersion: 2.9.2-3
+      - name: stable  # default
+        minVersion: 2.8.1-1
+        maxVersion: 2.9.2-3
+      defaultChannel: stable
+    - name: crunchy-postgres-operator
+      channels:
+      - name: v5  # default
+        minVersion: 5.1.0
+        maxVersion: 5.8.8
+      defaultChannel: v5
+    - name: dell-csm-operator-certified
+      channels:
+      - name: stable  # default
+        minVersion: 1.6.1
+        maxVersion: 1.12.2
+      defaultChannel: stable
+    - name: dxoperator
+      channels:
+      - name: alpha  # default
+        minVersion: 1.0.77
+        maxVersion: 1.0.78
+      defaultChannel: alpha
+    - name: dxoperator-v2
+      channels:
+      - name: alpha  # default
+        minVersion: 2.0.85
+        maxVersion: 2.0.88
+      defaultChannel: alpha
+    - name: eda-k8s-operator
+      channels:
+      - name: '6.0'  # default
+        minVersion: 6.0.0
+        maxVersion: 6.0.1
+      - name: stable
+        minVersion: 6.0.0
+        maxVersion: 6.0.0
+      defaultChannel: '6.0'
+    - name: edb-hcp-operator
+      channels:
+      - name: alpha
+        minVersion: 1.3.3
+        maxVersion: 1.3.10
+      - name: innovation
+        minVersion: 2026.1.0
+        maxVersion: 2026.5.1
+      - name: lts-v1.3
+        minVersion: 1.3.3
+        maxVersion: 1.3.10
+      - name: stable  # default
+        minVersion: 1.3.3
+        maxVersion: 2.1.0
+      defaultChannel: stable
+    - name: f5-ai-security-operator
+      channels:
+      - name: alpha
+        minVersion: 0.4.3
+        maxVersion: 0.4.3
+      - name: release-testing
+        minVersion: 0.0.2
+        maxVersion: 0.0.3
+      - name: stable  # default
+        minVersion: 0.6.1
+        maxVersion: 0.11.4
+      defaultChannel: stable
+    - name: gpu-operator-certified
+      channels:
+      - name: stable
+        minVersion: 1.10.0
+        maxVersion: 26.3.3
+      - name: v1.10
+        minVersion: 1.10.0
+        maxVersion: 1.10.1
+      - name: v1.11
+        minVersion: 1.10.0
+        maxVersion: 1.11.1
+      - name: v22.9
+        minVersion: 1.10.0
+        maxVersion: 22.9.2
+      - name: v23.3
+        minVersion: 1.10.0
+        maxVersion: 23.3.2
+      - name: v23.6
+        minVersion: 1.10.0
+        maxVersion: 23.6.1
+      - name: v23.9
+        minVersion: 1.10.0
+        maxVersion: 23.9.2
+      - name: v24.3
+        minVersion: 1.10.0
+        maxVersion: 24.3.0
+      - name: v24.6
+        minVersion: 1.10.0
+        maxVersion: 24.6.2
+      - name: v24.9
+        minVersion: 1.10.0
+        maxVersion: 24.9.2
+      - name: v25.3
+        minVersion: 1.10.0
+        maxVersion: 25.3.4
+      - name: v25.10
+        minVersion: 1.10.0
+        maxVersion: 25.10.1
+      - name: v26.3  # default
+        minVersion: 26.3.0
+        maxVersion: 26.3.3
+      defaultChannel: v26.3
+    - name: habana-ai-operator
+      channels:
+      - name: '1.22'
+        minVersion: 1.22.1-6-2
+        maxVersion: 1.22.2-32-2
+      - name: '1.23'
+        minVersion: 1.23.0-695
+        maxVersion: 1.23.0-695
+      - name: '1.24'
+        minVersion: 1.24.0-1007
+        maxVersion: 1.24.0-1007
+      - name: stable  # default
+        minVersion: 1.22.1-6-2
+        maxVersion: 1.24.0-1007
+      defaultChannel: stable
+    - name: hpe-csi-operator
+      channels:
+      - name: stable  # default
+        minVersion: 3.0.2
+        maxVersion: 3.2.0
+      defaultChannel: stable
+    - name: hspc-operator
+      channels:
+      - name: stable  # default
+        minVersion: 1.17.3
+        maxVersion: 1.18.3
+      defaultChannel: stable
+    - name: hulft
+      channels:
+      - name: stable  # default
+        minVersion: 10.3.0
+        maxVersion: 10.6.0
+      defaultChannel: stable
+    - name: intel-device-plugins-operator
+      channels:
+      - name: alpha
+        minVersion: 0.28.0
+        maxVersion: 0.32.2
+      - name: stable  # default
+        minVersion: 0.28.0
+        maxVersion: 0.36.0
+      defaultChannel: stable
+    - name: k10-kasten-operator-rhmp
+      channels:
+      - name: stable  # default
+        minVersion: 6.5.5
+        maxVersion: 9.0.2
+      defaultChannel: stable
+    - name: k8s-triliovault
+      channels:
+      - name: 3.1.x
+        minVersion: 3.1.0
+        maxVersion: 3.1.3
+      - name: 4.0.x
+        minVersion: 4.0.0
+        maxVersion: 4.0.5
+      - name: 5.0.x
+        minVersion: 5.0.0
+        maxVersion: 5.0.4
+      - name: 5.1.x
+        minVersion: 5.1.0
+        maxVersion: 5.1.2
+      - name: 5.2.x
+        minVersion: 5.2.0
+        maxVersion: 5.2.0
+      - name: 5.3.x  # default
+        minVersion: 5.3.0
+        maxVersion: 5.3.1
+      defaultChannel: 5.3.x
+    - name: kubecost-operator
+      channels:
+      - name: alpha
+        minVersion: 2.5.4
+        maxVersion: 2.8.2
+      - name: stable  # default
+        minVersion: 3.0.0
+        maxVersion: 3.2.1
+      defaultChannel: stable
+    - name: kurrentdb-operator
+      channels:
+      - name: stable-v1  # default
+        minVersion: 1.4.3
+        maxVersion: 1.6.0-0
+      defaultChannel: stable-v1
+    - name: linstor-operator
+      channels:
+      - name: stable-v2  # default
+        minVersion: 2.8.1
+        maxVersion: 2.11.0
+      defaultChannel: stable-v2
+    - name: minio-minkms-operator
+      channels:
+      - name: stable  # default
+        minVersion: 2025.12.20100920
+        maxVersion: 2026.7.16235330
+      defaultChannel: stable
+    - name: minio-object-store-operator
+      channels:
+      - name: stable  # default
+        minVersion: 2025.5.12190907
+        maxVersion: 2026.7.21224148
+      defaultChannel: stable
+    - name: nutanixcsioperator
+      channels:
+      - name: stable-3.x  # default
+        minVersion: 3.3.4
+        maxVersion: 3.7.2
+      defaultChannel: stable-3.x
+    - name: nvidia-network-operator
+      channels:
+      - name: stable  # default
+        minVersion: 25.7.0
+        maxVersion: 26.4.1
+      - name: v25.7
+        minVersion: 25.7.0
+        maxVersion: 25.7.0
+      - name: v25.10
+        minVersion: 25.10.0
+        maxVersion: 25.10.0
+      - name: v26.1
+        minVersion: 26.1.0
+        maxVersion: 26.1.0
+      - name: v26.4
+        minVersion: 26.4.0
+        maxVersion: 26.4.1
+      defaultChannel: stable
+    - name: openshift-fusion-access-operator
+      channels:
+      - name: stable-v1  # default
+        minVersion: 0.9.3
+        maxVersion: 1.2.0-3
+      defaultChannel: stable-v1
+    - name: operator-certification-operator
+      channels:
+      - name: alpha  # default
+        minVersion: 1.6.0
+        maxVersion: 1.6.0
+      defaultChannel: alpha
+    - name: pg4k-pgd
+      channels:
+      - name: candidate
+        minVersion: 1.2.0-rc1
+        maxVersion: 2.0.0-rc1
+      - name: stable  # default
+        minVersion: 1.0.1
+        maxVersion: 1.2.1
+      - name: stable-v2
+        minVersion: 2.0.0
+        maxVersion: 2.0.1
+      defaultChannel: stable
+    - name: portworx-certified
+      channels:
+      - name: alpha
+        minVersion: 1.6.1
+        maxVersion: 26.3.0
+      - name: stable  # default
+        minVersion: 1.6.1
+        maxVersion: 26.3.0
+      defaultChannel: stable
+    - name: portworx-multi-cluster-certified
+      channels:
+      - name: stable  # default
+        minVersion: 26.1.0
+        maxVersion: 26.1.0
+      defaultChannel: stable
+    - name: rbln-npu-operator
+      channels:
+      - name: candidate
+        minVersion: 0.4.0
+        maxVersion: 0.4.5
+      - name: fast
+        minVersion: 0.4.0
+        maxVersion: 0.4.5
+      - name: stable  # default
+        minVersion: 0.4.0
+        maxVersion: 0.4.5
+      defaultChannel: stable
+    - name: scaleops-operator
+      channels:
+      - name: stable-v1
+        minVersion: 1.26.8
+        maxVersion: 1.33.5
+      - name: stable-v1.26
+        minVersion: 1.26.8
+        maxVersion: 1.26.30
+      - name: stable-v1.27
+        minVersion: 1.27.1
+        maxVersion: 1.27.13
+      - name: stable-v1.28
+        minVersion: 1.28.0
+        maxVersion: 1.28.16
+      - name: stable-v1.29
+        minVersion: 1.29.3
+        maxVersion: 1.29.11
+      - name: stable-v1.30
+        minVersion: 1.30.0
+        maxVersion: 1.30.20
+      - name: stable-v1.31
+        minVersion: 1.31.1
+        maxVersion: 1.31.5
+      - name: stable-v1.32
+        minVersion: 1.32.2
+        maxVersion: 1.32.13
+      - name: stable-v1.33  # default
+        minVersion: 1.33.0
+        maxVersion: 1.33.5
+      defaultChannel: stable-v1.33
+    - name: stackable-airflow-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-commons-operator
+      channels:
+      - name: '25.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-druid-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-hbase-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-hdfs-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-hive-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-kafka-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-listener-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-nifi-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-opa-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-opensearch-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-secret-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-spark-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-superset-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-trino-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackable-zookeeper-operator
+      channels:
+      - name: '25.11'
+        minVersion: 25.11.0
+        maxVersion: 25.11.0
+      - name: '26.3'
+        minVersion: 26.3.0
+        maxVersion: 26.3.0
+      - name: '26.7'
+        minVersion: 26.7.0
+        maxVersion: 26.7.0
+      - name: stable  # default
+        minVersion: 25.11.0
+        maxVersion: 26.7.0
+      defaultChannel: stable
+    - name: stackgres-certified
+      channels:
+      - name: candidate
+        minVersion: 1.18.1
+        maxVersion: 1.19.0-rc5
+      - name: fast
+        minVersion: 1.18.1
+        maxVersion: 1.19.0-rc5
+      - name: stable  # default
+        minVersion: 1.18.1
+        maxVersion: 1.19.0
+      defaultChannel: stable
+    - name: strategy-operator
+      channels:
+      - name: stable-v1  # default
+        minVersion: 26.5.6
+        maxVersion: 26.7.1
+      defaultChannel: stable-v1
+    - name: tigera-operator
+      channels:
+      - name: release-v1.40
+        minVersion: 1.40.2
+        maxVersion: 1.40.4
+      - name: release-v1.42  # default
+        minVersion: 1.42.0
+        maxVersion: 1.42.0
+      defaultChannel: release-v1.42
+    - name: trident-operator
+      channels:
+      - name: stable  # default
+        minVersion: 25.10.0
+        maxVersion: 26.6.0
+      defaultChannel: stable
+    - name: victoriametrics-operator
+      channels:
+      - name: beta  # default
+        minVersion: 0.68.2
+        maxVersion: 0.74.1
+      - name: stable
+        minVersion: 0.68.5
+        maxVersion: 0.68.5
+      defaultChannel: beta
+    - name: visionone-containersecurity
+      channels:
+      - name: alpha
+        minVersion: 3.3.9
+        maxVersion: 3.5.1
+      - name: stable  # default
+        minVersion: 3.3.9
+        maxVersion: 3.5.1
+      defaultChannel: stable
+    - name: xspc-operator
+      channels:
+      - name: stable  # default
+        minVersion: 1.16.1
+        maxVersion: 1.18.1
+      defaultChannel: stable

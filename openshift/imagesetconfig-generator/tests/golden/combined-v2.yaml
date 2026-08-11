@@ -1,0 +1,24 @@
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+mirror:
+  operators:
+  - catalog: example.com/operators/test-catalog:v1
+    packages:
+    - name: amq-streams
+      channels:
+      - name: stable  # default
+      defaultChannel: stable
+    - name: amq-streams-console
+      channels:
+      - name: alpha  # default
+      defaultChannel: alpha
+    - name: local-storage-operator
+      channels:
+      - name: '3.15'  # default
+      - name: stable
+      defaultChannel: '3.15'
+    - name: sample-operator
+      channels:
+      - name: preview
+      - name: stable  # default
+      defaultChannel: stable
