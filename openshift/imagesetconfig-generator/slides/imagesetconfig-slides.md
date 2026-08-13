@@ -28,7 +28,9 @@ Manually crafting `ImageSetConfiguration` YAML files for OpenShift's `oc-mirror`
 
 A Python tool that:
 
-1. **Pulls** a catalog image from a container registry
+1. **Pulls** a catalog image from a container registry 
+   a.  registry.redhat.io
+   b.  airgap
 2. **Extracts** the internal File-Based Catalog (FBC) data
 3. **Generates** a complete, correct `ImageSetConfiguration` YAML
 
@@ -103,6 +105,60 @@ pip install pyyaml                # Others
 
 Each step can run standalone or chained.
 A catalog won't be pulled a second time ( cached ) if it has not been updated.
+
+---
+
+## Key Features
+
+- **v1 & v2 output** — supports both `v1alpha2` and `v2alpha1` `oc-mirror` formats
+- **Version comments** — `--version-comment` lists all versions per channel as YAML comments
+- **min/max version** — `--min-max-version` auto-fills `minVersion` / `maxVersion` keys
+- **TLS control** — `--tls-verify false` for internal registries
+- **GPG bypass** — `--disable-signature-policy` for non-RHEL systems
+- **Local mode** — `--configs /path` skips fetch/extract for already-extracted data
+
+---
+
+## Advanced Usage
+
+Add version comments and min/max bounds:
+
+```bash
+./imagesetconfig-generator.py \
+  -c registry.redhat.io/redhat/redhat-operator-index:v4.20 \
+  --generate config.yaml --v2 \
+  --version-comment --min-max-version
+```
+
+Generate from pre-extracted data in /tmp/redhat-operator-index_v4.20 :
+
+```bash
+./imagesetconfig-generator.py \
+  -c my-catalog:v1 \
+  --configs /tmp/redhat-operator-index_v4.20 \
+  --generate offline-config.yaml --v1
+```
+
+---
+
+## Resources
+
+| Resource | Link |
+|----------|------|
+| Source code | `imagesetconfig-generator.py` |
+| Design doc | `doc/design.md` |
+| Test suite | `tests/` |
+| TODO | `TODO.md` |
+| oc-mirror docs | Openshift documentation |
+
+---
+
+## Questions?
+
+---
+
+
+## Appendix
 
 ---
 
@@ -231,38 +287,6 @@ How the tool finds all available versions per channel:
 
 ---
 
-## Key Features
-
-- **v1 & v2 output** — supports both `v1alpha2` and `v2alpha1` `oc-mirror` formats
-- **Version comments** — `--version-comment` lists all versions per channel as YAML comments
-- **min/max version** — `--min-max-version` auto-fills `minVersion` / `maxVersion` keys
-- **TLS control** — `--tls-verify false` for internal registries
-- **GPG bypass** — `--disable-signature-policy` for non-RHEL systems
-- **Local mode** — `--configs /path` skips fetch/extract for already-extracted data
-
----
-
-## Advanced Usage
-
-Add version comments and min/max bounds:
-
-```bash
-./imagesetconfig-generator.py \
-  -c registry.redhat.io/redhat/redhat-operator-index:v4.20 \
-  --generate config.yaml --v2 \
-  --version-comment --min-max-version
-```
-
-Generate from pre-extracted data in /tmp/redhat-operator-index_v4.20 :
-
-```bash
-./imagesetconfig-generator.py \
-  -c my-catalog:v1 \
-  --configs /tmp/redhat-operator-index_v4.20 \
-  --generate offline-config.yaml --v1
-```
-
----
 
 ## Testing
 
@@ -277,18 +301,4 @@ Two tiers:
 - **Unit tests** — FBC parsing and YAML generation against synthetic data
 - **Real catalog tests** — against pinned public catalog clones for golden-file validation
 
----
 
-## Resources
-
-| Resource | Link |
-|----------|------|
-| Source code | `imagesetconfig-generator.py` |
-| Design doc | `doc/design.md` |
-| Test suite | `tests/` |
-| TODO | `TODO.md` |
-| oc-mirror docs | Openshift documentation |
-
----
-
-## Questions?
