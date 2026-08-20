@@ -14,6 +14,7 @@ For a deep dive into how catalog images are built and how this tool deciphers th
 * **Smart Sorting:** Uses natural sorting for channels (e.g., ensures `4.10` comes after `4.9`).
 * **Version Listing (`--version-comment`):** Adds the full list of available versions as a comment below each channel, making it easy to pick versions.
 * **minVersion/maxVersion (`--min-max-version`):** Automatically emits `minVersion`/`maxVersion` keys per channel from the channel's version list. Can be combined with `--version-comment`.
+* **Catalog Digest Pin:** Records the catalog image's `sha256` digest as a comment below the `catalog:` line, so you can reproduce an identical `ImageSetConfiguration` even if the tag is retagged upstream.
 * **Flexible Fetching:**
   * Handles TLS verification toggling.
   * Configurable timeouts for slow connections.
@@ -84,6 +85,10 @@ The general syntax is:
 | `--timeout` | No | Timeout in seconds for the pull operation (default: 600). |
 | `--version-comment` | No | Adds the full list of available versions as a comment below each channel. |
 | `--min-max-version` | No | Adds `minVersion`/`maxVersion` keys per channel based on the available versions. Can be combined with `--version-comment`. |
+| `--oc-mirror-list-operators` | No | Prints a `NAME / DISPLAY NAME / DEFAULT CHANNEL` table mirroring `oc-mirror list operators`. Requires extracted configs (combine with `--extract`, or pass `--configs`). |
+| `--list-operators` | No | Prints just the operator names, one per line (no header or columns). Requires extracted configs (combine with `--extract`, or pass `--configs`). |
+| `--from-operator-list` | No | Path to a file of operator names (one per line) restricting `--generate` to those operators only. Unknown operators cause a non-zero exit listing every missing name; use `--continue-on-error` to generate anyway. |
+| `--continue-on-error` | No | Used with `--from-operator-list`: generate the config even when some listed operators are not in the catalog (mirrors `oc-mirror v1 --continue-on-error`). |
 | `--verbose` | No | Enables verbose logging of file processing during generation. |
 
 ## Workflow & Examples
@@ -155,6 +160,94 @@ auto-generated `minVersion`/`maxVersion` keys for use with `oc-mirror`:
 
 ```
 
+### 5. List Operators (mirror `oc-mirror list operators`)
+
+Print a `NAME / DISPLAY NAME / DEFAULT CHANNEL` table for every operator in the
+catalog, replicating the output of `oc-mirror list operators`:
+
+```bash
+./imagesetconfig-generator.py \
+  -c registry.redhat.io/redhat/redhat-operator-index:v4.20 \
+  --extract \
+  --oc-mirror-list-operators
+
+```
+
+Example output:
+
+```
+NAME                                            DISPLAY NAME                                                 DEFAULT CHANNEL
+3scale-operator                                 Red Hat Integration - 3scale - Managed Application Services  threescale-2.16
+amq-streams                                     Streams for Apache Kafka                                     stable
+amq-streams-console                             Streams for Apache Kafka Console                             stable
+advanced-cluster-management                     Advanced Cluster Management for Kubernetes                   release-2.17
+```
+
+The display name is read from each bundle's `olm.csv.metadata` property (when
+present in the catalog); operators without one show `-`. Like `oc-mirror`, if
+you want both the ImageSetConfiguration YAML *and* the operator table, combine
+this flag with `--generate`.
+
+### 6. List Operator Names Only
+
+Print just the operator names, one per line (no header or columns), useful for
+feeding into scripts or loops:
+
+```bash
+./imagesetconfig-generator.py \
+  -c registry.redhat.io/redhat/redhat-operator-index:v4.20 \
+  --list-operators
+
+```
+
+Example output:
+
+```
+3scale-operator
+advanced-cluster-management
+amq7-interconnect-operator
+amq-broker-rhel8
+amq-streams
+...
+```
+
+### 7. Generate from an Operator List
+
+Restrict `--generate` to a curated set of operators (e.g. from your
+`--list-operators` output) instead of dumping every package in the catalog.
+Create a file with one operator name per line:
+
+```
+amq-streams
+3scale-operator
+openshift-gitops-operator
+```
+
+Then generate a config containing only those operators:
+
+```bash
+./imagesetconfig-generator.py \
+  -c registry.redhat.io/redhat/redhat-operator-index:v4.20 \
+  --from-operator-list operators.txt \
+  --generate config.yaml
+
+```
+
+All the usual generation flags still apply (`--v2`, `--version-comment`,
+`--min-max-version`, `--configs`). If a name in the list is missing from the
+catalog, the tool lists **all** missing operators and exits without writing a
+file (so you can fix your list). To generate anyway for the operators that were
+found, add `--continue-on-error`:
+
+```bash
+./imagesetconfig-generator.py \
+  -c registry.redhat.io/redhat/redhat-operator-index:v4.20 \
+  --from-operator-list operators.txt \
+  --continue-on-error \
+  --generate config.yaml
+
+```
+
 ## Output Format
 
 The tool generates a valid `ImageSetConfiguration` YAML.
@@ -166,6 +259,7 @@ apiVersion: mirror.openshift.io/v2alpha1
 kind: ImageSetConfiguration
 mirror:
   operators:
+  # catalog: registry.redhat.io/redhat/redhat-operator-index@sha256:7ee16003e0e7e13e0905fca1a981dab22cfe245f5a4e038b420be50dc624a9e5
   - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.20
     packages:
     - name: quay-operator
@@ -181,6 +275,19 @@ mirror:
       defaultChannel: stable-3.17
 
 ```
+
+The `# catalog: <...@sha256:...>` comment (below the `catalog:` line) pins the
+exact digest of the catalog image used to generate this file. Since tags can be
+retagged upstream over time, mirroring by digest
+
+```
+podman pull registry.redhat.io/redhat/redhat-operator-index@sha256:7ee16003...
+```
+
+is the only way to guarantee you get the *same* set of operators. The digest is
+resolved from the locally stored image; if it is not available locally (e.g.
+using `--configs` on a machine without the image pulled), the comment is
+omitted and a note is printed, but generation still succeeds.
 
 ## Troubleshooting
 

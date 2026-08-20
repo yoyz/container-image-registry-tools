@@ -17,7 +17,8 @@
   "schema": "olm.bundle",
   "name": "amq-streams.v2.2.0",
   "properties": [
-    { "type": "olm.package", "value": { "packageName": "amq-streams", "version": "2.2.0" } }
+    { "type": "olm.package", "value": { "packageName": "amq-streams", "version": "2.2.0" } },
+    { "type": "olm.csv.metadata", "value": { "displayName": "Streams for Apache Kafka" } }
   ]
 }
 {

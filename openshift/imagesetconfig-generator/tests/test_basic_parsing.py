@@ -11,6 +11,8 @@ import tempfile
 import unittest
 import unittest.mock
 
+import yaml
+
 from helpers import assemble_combined_config, fixture_path, golden_path, load_generator
 
 MOD = load_generator()
@@ -149,19 +151,21 @@ class TestRefactoredHelpers(unittest.TestCase):
         b = MOD._make_pkg_entry()
         a['channels'].add('x')
         self.assertEqual(b['channels'], set(), "entries must not share mutable state")
-        self.assertEqual(b, {'channels': set(), 'default': None, 'versions': {}})
+        self.assertEqual(b, {'channels': set(), 'default': None, 'versions': {}, 'display': None})
 
     def test_handle_doc_package(self):
         pkg_map = {}
-        MOD._handle_doc({'schema': 'olm.package', 'name': 'p1',
-                         'defaultChannel': 'stable'}, pkg_map, {}, verbose=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            MOD._handle_doc({'schema': 'olm.package', 'name': 'p1',
+                             'defaultChannel': 'stable'}, pkg_map, {}, verbose=True)
         self.assertEqual(pkg_map['p1']['default'], 'stable')
 
     def test_handle_doc_channel(self):
         pkg_map = {}
         doc = {'schema': 'olm.channel', 'package': 'p1', 'name': 'stable',
                'entries': [{'name': 'p1.v1.0.0'}, {'name': 'p1.v1.0.0'}]}
-        MOD._handle_doc(doc, pkg_map, {}, verbose=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            MOD._handle_doc(doc, pkg_map, {}, verbose=True)
         self.assertEqual(pkg_map['p1']['channels'], {'stable'})
         self.assertEqual(pkg_map['p1']['versions']['stable'], ['p1.v1.0.0'])
 
@@ -170,7 +174,8 @@ class TestRefactoredHelpers(unittest.TestCase):
         doc = {'schema': 'olm.bundle', 'name': 'p1.v1.0.0',
                'properties': [{'type': 'olm.package',
                                'value': {'version': '1.0.0'}}]}
-        MOD._handle_doc(doc, {}, bundle_versions, verbose=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            MOD._handle_doc(doc, {}, bundle_versions, verbose=True)
         self.assertEqual(bundle_versions['p1.v1.0.0'], '1.0.0')
 
     def test_resolve_versions_sorts_naturally(self):
@@ -185,6 +190,164 @@ class TestRefactoredHelpers(unittest.TestCase):
         pkg_map = {'p1': {'versions': {'stable': ['p1.v1.0.0']}}}
         MOD._resolve_versions(pkg_map, {})
         self.assertEqual(pkg_map['p1']['versions']['stable'], ['1.0.0'])
+
+
+class TestListOperators(unittest.TestCase):
+    """Coverage for --oc-mirror-list-operators (NAME / DISPLAY NAME / DEFAULT CHANNEL)."""
+
+    def test_display_name_captured_from_csv_metadata(self):
+        pkg_map = parse(fixture_path('prefix-collision'))
+        self.assertEqual(pkg_map['amq-streams']['display'],
+                         'Streams for Apache Kafka')
+
+    def test_display_name_defaults_to_dash_when_absent(self):
+        pkg_map = parse(fixture_path('prefix-collision'))
+        self.assertIsNone(pkg_map['amq-streams-console']['display'])
+
+    def test_list_includes_header_and_packages(self):
+        pkg_map = parse(fixture_path('prefix-collision'))
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            MOD.handle_list_operators(FAKE_CATALOG, pkg_map)
+        out = buf.getvalue()
+        self.assertIn('NAME', out)
+        self.assertIn('DISPLAY NAME', out)
+        self.assertIn('DEFAULT CHANNEL', out)
+        self.assertIn('amq-streams', out)
+        self.assertIn('Streams for Apache Kafka', out)
+        self.assertIn('amq-streams-console', out)
+
+    def test_list_columns_align(self):
+        """The DEFAULT CHANNEL column must start at the same index on every row."""
+        pkg_map = parse(fixture_path('prefix-collision'))
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            MOD.handle_list_operators(FAKE_CATALOG, pkg_map)
+        lines = buf.getvalue().splitlines()
+        header_idx = lines[0].index('DEFAULT CHANNEL')
+        for row in lines[1:]:
+            default = row.split()[-1]
+            self.assertEqual(row.find(default), header_idx,
+                             f"column misaligned: {row!r}")
+
+    def test_list_writes_output_file(self):
+        pkg_map = parse(fixture_path('prefix-collision'))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, 'operators.txt')
+            with contextlib.redirect_stdout(io.StringIO()):
+                MOD.handle_list_operators(FAKE_CATALOG, pkg_map, output_file=out)
+            with open(out) as f:
+                self.assertIn('DEFAULT CHANNEL', f.read())
+
+    def test_list_no_operators(self):
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            MOD.handle_list_operators(FAKE_CATALOG, {})
+        self.assertIn('No operators found.', buf.getvalue())
+
+    def test_list_names_prints_names_only(self):
+        pkg_map = parse(fixture_path('prefix-collision'))
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            MOD.handle_list_names(pkg_map)
+        lines = [l for l in buf.getvalue().splitlines() if l]
+        self.assertEqual(lines, ['amq-streams', 'amq-streams-console'])
+        self.assertNotIn('DEFAULT CHANNEL', buf.getvalue())
+
+    def test_list_names_empty(self):
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            MOD.handle_list_names({})
+        self.assertIn('No operators found.', buf.getvalue())
+
+
+class TestOperatorList(unittest.TestCase):
+    """Coverage for --from-operator-list (load / filter / validate)."""
+
+    def _write_list(self, tmp, content):
+        path = os.path.join(tmp, 'operators.txt')
+        with open(path, 'w') as f:
+            f.write(content)
+        return path
+
+    def test_load_operator_list_plain_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_list(tmp, "amq-streams\n3scale-operator\n\n")
+            self.assertEqual(MOD.load_operator_list(path),
+                             ['amq-streams', '3scale-operator'])
+
+    def test_load_operator_list_strips_whitespace_and_comments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_list(tmp, "  amq-streams  \n# full comment\n3scale-operator # trailing\n")
+            self.assertEqual(MOD.load_operator_list(path),
+                             ['amq-streams', '3scale-operator'])
+
+    def test_load_operator_list_missing_file(self):
+        with self.assertRaises(OSError):
+            MOD.load_operator_list('/no/such/file.txt')
+
+    def test_filter_pkg_map_keeps_matching_only(self):
+        pkg_map = parse(fixture_path('prefix-collision'))
+        filtered = MOD.filter_pkg_map(pkg_map, ['amq-streams', 'not-present'])
+        self.assertEqual(sorted(filtered.keys()), ['amq-streams'])
+
+    def test_check_operator_list_reports_missing(self):
+        pkg_map = parse(fixture_path('prefix-collision'))
+        missing = MOD.check_operator_list(pkg_map, ['amq-streams', 'bogus-one', 'bogus-two'])
+        self.assertEqual(missing, ['bogus-one', 'bogus-two'])
+
+    def test_check_operator_list_all_present(self):
+        pkg_map = parse(fixture_path('prefix-collision'))
+        self.assertEqual(
+            MOD.check_operator_list(pkg_map, ['amq-streams', 'amq-streams-console']), [])
+
+    def test_generate_from_list_v1(self):
+        """Only the selected operators appear; v1 has no defaultChannel key."""
+        pkg_map = parse(fixture_path('prefix-collision'))
+        pkg_map = MOD.filter_pkg_map(pkg_map, ['amq-streams'])
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, 'out.yaml')
+            with contextlib.redirect_stdout(io.StringIO()):
+                MOD.write_image_set_config(out, FAKE_CATALOG, pkg_map, version='v1')
+            with open(out) as f:
+                text = f.read()
+        doc = yaml.safe_load(text)
+        pkgs = doc['mirror']['operators'][0]['packages']
+        self.assertEqual([p['name'] for p in pkgs], ['amq-streams'])
+        self.assertNotIn('defaultChannel', pkgs[0])
+
+
+class TestCatalogDigest(unittest.TestCase):
+    """Coverage for the catalog sha256 pin comment."""
+
+    def test_resolve_catalog_digest_success(self):
+        dig = 'registry.redhat.io/redhat/redhat-operator-index@sha256:abc'
+        fake = type('R', (), {'stdout': dig + '\n'})()
+        with unittest.mock.patch.object(MOD.subprocess, 'run', return_value=fake) as run:
+            self.assertEqual(MOD.resolve_catalog_digest('cat:tag'), dig)
+            run.assert_called_once()
+
+    def test_resolve_catalog_digest_returns_none_on_error(self):
+        with unittest.mock.patch.object(MOD.subprocess, 'run',
+                                        side_effect=MOD.subprocess.CalledProcessError(125, ['podman'])):
+            self.assertIsNone(MOD.resolve_catalog_digest('cat:tag'))
+
+    def test_digest_comment_emitted(self):
+        pkg_map = parse(fixture_path('prefix-collision'))
+        dig = 'example.com/operators/test-catalog@sha256:deadbeef'
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, 'out.yaml')
+            with contextlib.redirect_stdout(io.StringIO()):
+                MOD.write_image_set_config(out, FAKE_CATALOG, pkg_map,
+                                           catalog_digest=dig)
+            with open(out) as f:
+                text = f.read()
+        self.assertIn(f'# catalog: {dig}', text)
+
+    def test_digest_comment_omitted_when_none(self):
+        pkg_map = parse(fixture_path('prefix-collision'))
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, 'out.yaml')
+            with contextlib.redirect_stdout(io.StringIO()):
+                MOD.write_image_set_config(out, FAKE_CATALOG, pkg_map)
+            with open(out) as f:
+                text = f.read()
+        self.assertNotIn('# catalog:', text)
 
 
 class TestExtractTlsVerify(unittest.TestCase):
