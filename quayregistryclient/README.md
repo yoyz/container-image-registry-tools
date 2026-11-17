@@ -9,13 +9,16 @@ nothing about *why*: which repositories actually exist, which ones are mirrors, 
 each mirror is synchronised against, which robot account it uses, and what a
 synchronisation error means once Quay has decrypted it.
 
+Current version: **0.4.0**.
+
 ## Features
 
 * **Registry navigation** — list repositories (paginated) and tags, walk an org tree.
 * **Deep inspection** — image digests (SHA), raw JSON manifests, individual blob layers,
   TLS certificate of the endpoint.
 * **Quay mirroring inventory** — per-repository mirror configuration plus health,
-  perimeter and robot-account aggregates (`mirror-scan`).
+  perimeter and robot-account aggregates (`mirror-scan`), and the repository /
+  organisation auto-prune (garbage-collection retention) policies (`mirror-get`).
 * **Authentication** — Basic auth, bearer tokens, a Quay *session cookie*, and automatic
   discovery of credentials already stored by podman/docker. See
   [Authentication](#authentication).
@@ -35,6 +38,9 @@ synchronisation error means once Quay has decrypted it.
 ```bash
 pip install requests
 ```
+
+Python 3.10+ is not required: on older 3.x, `get-server-certificate` prints the
+leaf certificate instead of the full chain (and says so on stderr).
 
 ## Usage
 
@@ -62,9 +68,11 @@ pip install requests
 | `--show-secrets` | Do not mask secret-bearing fields in API responses. |
 | `--orgs a,b,c` | Candidate organisations for `org-exists`. |
 | `--pages N` | Page limit for `search-v1`. |
+| `--desc` | `search-v1`: also show repository descriptions. |
 | `--only-problems` | `mirror-scan`: keep only repositories whose mirror is unhealthy. |
 | `--max-repos N` / `--offset N` | `mirror-scan`: window over an organisation. |
 | `--i-am-deleting-all-repo` | Required confirmation for `delete-all-repo`. |
+| `-h`, `--help` | Show the help; also works per command (`mirror-scan -h`). |
 | `--generate-completion` | Print a bash completion script and exit. |
 
 > Where credentials are omitted, the tool loads them from the credential stores it
@@ -108,14 +116,14 @@ turned off.
 | `list-org-repos` | `/api/v1/…/repository` | `-r -o` + API credential | read |
 | `org-robots` | `/api/v1/…/robots` | `-r -o` + API credential | read |
 | `repo-view` | `/api/v1/repository/<org>/<name>` | `-r -i` + API credential | read |
-| `mirror-get` | repository + mirror config | `-r -i` + API credential | read |
+| `mirror-get` | repository + mirror config + **auto-prune (GC) policies** | `-r -i` + API credential | read |
 | `mirror-scan` | per-repo mirror inventory, with `HEALTH` / `PERIMETRE` / `ROBOTS` aggregates | `-r -o` + API credential | read |
 | `browse-api` | any `/api/v1` path, `GET` | `-r -T -a` | read |
 | `quay-api-discovery` | `/api/v1/discovery` | `-r -T` | read |
 | `quay-api-listuser` | `/api/v1/superuser/users/` | `-r -T` | read |
 | `delete-repo` | `DELETE` repository | `-r -i -T` | **read/write — disabled** |
 | `delete-tag` | `DELETE` tag | `-r -i -t -T` | **read/write — disabled** |
-| `delete-all-repo` | `DELETE` every repository of an org | `-r -u -p -T --i-am-deleting-all-repo` | **read/write — disabled** |
+| `delete-all-repo` | `DELETE` every repository of an org, after a 10 s countdown | `-r -u -p -T --i-am-deleting-all-repo` | **read/write — disabled** |
 | `set-api-key-value` | `PUT` config key | `-r -T -a -K -V` | **read/write — disabled** |
 | `quay-api-create-user` | `POST /api/v1/superuser/users/` | `-r -T -u` | **read/write — disabled** |
 | `quay-api-delete-user` | `DELETE /api/v1/superuser/users/<user>` | `-r -T -u` | **read/write — disabled** |
@@ -133,6 +141,12 @@ Two notes on this table:
   They never create, modify or delete a registry object, but a failed sign-in *does*
   have side effects — see the warning under
   [Web sign-in](#3-web-sign-in-session-cookie).
+
+> **Garbage collection.** Quay runs GC cluster-wide and the API exposes **no
+> per-repository GC timestamp**. The per-repository signals are the auto-prune
+> (retention) policies, which `mirror-get` now prints for both the repository and
+> its organisation, and the repository state: `MARKED_FOR_DELETION` (see
+> `repo-view`) means it is queued for GC.
 
 ### Quirks this tool encodes
 
@@ -296,6 +310,11 @@ Set it to `False` only when you intend to mutate a registry, and only after re-c
 the target: on a mirrored estate the same command line can be run against a hub *and*
 against a regional registry that holds the content customers pull.
 
+When the lock is off, `delete-all-repo` still requires
+`--i-am-deleting-all-repo` **and** displays a 10-second countdown on stderr before
+the first request; `Ctrl+C` during the countdown aborts with exit code 130 and
+deletes nothing.
+
 ---
 
 ## Output hygiene
@@ -315,10 +334,12 @@ against a regional registry that holds the content customers pull.
 | Code | Meaning |
 | --- | --- |
 | 0 | success |
+| 1 | certificate retrieval failure, or `delete-all-repo` without `--i-am-deleting-all-repo` |
 | 2 | missing parameters |
 | 3 | credential refused by the registry at the token-grant step (`-d` shows the registry's own message; re-run `podman login`) |
 | 4 | command refused by [read-only mode](#read-only-mode) |
 | 5 | no usable `/api/v1` credential in any of the three modes |
+| 130 | `delete-all-repo` countdown interrupted with `Ctrl+C` (nothing deleted) |
 
 ---
 
@@ -384,4 +405,10 @@ the environment (`QRC_TOKEN`, …) rather than the command line, so they never a
 
 `mirror-get` on a mirror shows the upstream URL, the robot used, the last
 `sync_status` and `last_update` — Quay's own words, which is where the difference
-between *misconfigured* and *upstream gone* becomes visible.
+between *misconfigured* and *upstream gone* becomes visible — followed by the
+auto-prune (GC retention) policies of the repository and of its organisation.
+
+```bash
+# 4. Keep only the mirrors that need attention
+./quayregistryclient mirror-scan -r registry.example.com -o myorg --only-problems --max-repos 50
+```

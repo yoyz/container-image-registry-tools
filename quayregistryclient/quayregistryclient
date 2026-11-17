@@ -3,17 +3,23 @@
 
 
 
-from urllib.parse import urlencode, quote_plus, quote
-import requests, json, argparse, sys, hashlib, re, signal,ssl, socket, os, base64
+from urllib.parse import urlencode, quote
+import requests, json, argparse, sys, re, signal,ssl, socket, os, base64, curses, time
 
-DEFAULT_PORT=443
-DEFAULT_PROTOCOL="https://"
 EXIT_TAG_NOT_FOUND=3
-ssl_already_verified=0
+EXIT_ABORTED=130
+DELETE_ALL_COUNTDOWN=10
+# Cache of TLS trust checks, keyed by (host, port)
+ssl_already_verified={}
 debug=None
-VERSION = "0.3"
+VERSION = "0.4.0"
 
 # VERSION = "0.3" Adding quayapi stuff related to create delete changepassword of a user
+# VERSION = "0.4.0" TLS fallback for Python < 3.10 + per-host trust cache; working
+#                  --help on every sub-command; unified catalog fetch (no more
+#                  UnboundLocalError / infinite pagination loop); 10s countdown
+#                  before delete-all-repo; auto-prune (GC) policies in mirror-get;
+#                  dead code and unused variables removed.
 
 def signal_handler(sig, frame):
     sys.exit(0)
@@ -30,26 +36,36 @@ def getservercertificate(registry_url, Port):
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
-        pem_chain = []  
+        pem_chain = []
 
         # 3. Connect and wrap the socket
         with socket.create_connection((registry_url, int(Port)), timeout=10) as sock:
-            with context.wrap_socket(sock, server_hostname=registry_url) as ssock: 
-                
-                # 4. Use get_unverified_chain() for Python 3.10+
-                chain = ssock.get_unverified_chain()
-                
-                if not chain:
-                    print("No certificates returned by the server.")
-                    return None
-                
+            with context.wrap_socket(sock, server_hostname=registry_url) as ssock:
+
+                # 4. get_unverified_chain() only exists on Python 3.10+, where it
+                #    returns the full chain. On older 3.x fall back to the leaf
+                #    certificate exposed by getpeercert().
+                get_chain = getattr(ssock, "get_unverified_chain", None)
+                if get_chain is not None:
+                    chain = get_chain()
+                    if not chain:
+                        printstderr(f"No certificates returned by {registry_url}:{Port}.")
+                        return None
+                else:
+                    der_cert = ssock.getpeercert(binary_form=True)
+                    if not der_cert:
+                        printstderr(f"No certificate returned by {registry_url}:{Port}.")
+                        return None
+                    printstderr("Note: full chain unavailable (Python < 3.10), showing leaf certificate only.")
+                    chain = [der_cert]
+
                 # Convert each DER certificate in the chain to PEM
                 for cert in chain:
                     pem_cert = ssl.DER_cert_to_PEM_cert(cert)
                     pem_chain.append(pem_cert)
-        
+
         cert_pem = "\n".join(pem_chain)
-        
+
         print(cert_pem)
 
         if checkhttpsconnection(registry_url,Port)==0:
@@ -60,26 +76,29 @@ def getservercertificate(registry_url, Port):
             printstderr("This server certificate is trusted locally.")
         return cert_pem
 
-    except Exception as e: 
+    except Exception as e:
         # 6. Catch the actual exception 'e' so you know exactly what broke
-        print(f"Error: Could not retrieve certificates from {registry_url} on port {Port}.")
-        print(f"Details: {e}")
+        printstderr(f"Error: Could not retrieve certificates from {registry_url} on port {Port}.")
+        printstderr(f"Details: {e}")
         sys.exit(1)
 
 def checkhttpsconnection(registry_url, port):
     global ssl_already_verified
-    if ssl_already_verified==1:
-        return ssl_already_verified
+    key = (registry_url, str(port))
+    if key in ssl_already_verified:
+        return 1 if ssl_already_verified[key] else 0
     try:
-        response = requests.get("https://"+registry_url+":"+str(port) , timeout=5)
-        ssl_already_verified=1
-        return(ssl_already_verified)
+        requests.get("https://"+registry_url+":"+str(port) , timeout=5)
+        ssl_already_verified[key] = True
+        return 1
     except requests.exceptions.SSLError:
         printstderr("The server certificate is NOT trusted locally.")
-        return(0)
+        ssl_already_verified[key] = False
+        return 0
     except requests.exceptions.RequestException as e:
         printstderr(f"An unrelated error occurred: {e}")
-        return(0)
+        ssl_already_verified[key] = False
+        return 0
     
 
 def log_python_request_curl_transform(method, url, headers, data=None):
@@ -221,12 +240,9 @@ def listcatalog(registry_url, username, password,Port):
         return(0)
     
     if username==None and password==None:
-        catalog_url = f"https://{registry_url}:{Port}/v2/_catalog"
-        response = requests.get(catalog_url)
-        if response.status_code == 200:
-            #printstderr("200 OK")
-            images=fetch_catalog_v2_token(registry_url,Port,None)            
-        else:
+        # Anonymous access: fetch_catalog_v2() skips the Authorization header.
+        images=fetch_catalog_v2_token(registry_url,Port,None)
+        if images is None:
             printstderr("Failed to get catalog")
             return(0)
     elif username!=None and password!=None:
@@ -248,7 +264,6 @@ def listtags(registry_url, username, password,Port,imageName):
     if checkhttpsconnection(registry_url,Port)==0:
         return(0)
 
-    token=getToken(registry_url, username, password,Port)
     token2=getTokenForImageScope(registry_url, username, password,Port,imageName)
     image_tag=get_tag_image(registry_url, username, password,Port,token2,imageName)
     print(json.dumps(image_tag))
@@ -260,6 +275,9 @@ def listall(registry_url, username, password,Port):
     token=getToken(registry_url, username, password,Port)
     #list_image_in_catalog(registry_url, username, password,Port,token)        
     images=fetch_catalog_v2(registry_url, username, password,Port,token)
+    if images is None:
+        printstderr("No images has been found")
+        return(0)
 
     for image in sorted(images["repositories"]):
         token2=getTokenForImageScope(registry_url, username, password,Port,image)
@@ -282,7 +300,6 @@ def getimagedigest(registry_url, username, password,Port,imageName,tag):
     if checkhttpsconnection(registry_url,Port)==0:
         return(0)
 
-    token=getToken(registry_url, username, password,Port)
     token2=getTokenForImageScope(registry_url, username, password,Port,imageName)
     image_tag=get_tag_image(registry_url, username, password,Port,token2,imageName)
     if tag not in image_tag["tags"]:
@@ -299,7 +316,6 @@ def getimagemanifest(registry_url, username, password,Port,imageName,digest):
     if checkhttpsconnection(registry_url,Port)==0:
         return(0)
 
-    token=getToken(registry_url, username, password,Port)
     token2=getTokenForImageScope(registry_url, username, password,Port,imageName)
 
     manifest=get_manifestlist(registry_url, username, password,Port,token2,imageName,digest)
@@ -311,118 +327,67 @@ def getblob(registry_url, username, password,Port,imageName,digest):
     if checkhttpsconnection(registry_url,Port)==0:
         return(0)
 
-    token=getToken(registry_url, username, password,Port)
     token2=getTokenForImageScope(registry_url, username, password,Port,imageName)
 
     blob=get_blob(registry_url, username, password,Port,token2,imageName,digest)
     print(blob, end="")
 
-def fetch_catalog_v2(registry_url, username, password,Port,token):
+def fetch_catalog_v2(registry_url, username, password,Port,token=None):
+    """Fetch the registry catalog, following the pagination Link headers.
+
+    The token is optional: when it is None the request is sent anonymously.
+    Returns a dict like {"repositories": [...]}, or None on failure.
+    """
     if debug:
         printstderr("# fetch_catalog_v2")
     if checkhttpsconnection(registry_url,Port)==0:
-        return(0)
+        return None
 
-    # Set the headers with authentication
-    more_image=1
-    auth = (username, password)
+    # username/password are kept in the signature for backward compatibility;
+    # authentication is carried by the Bearer token only.
     headers = {
         'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': "Bearer "+token
-    }    
-    url_short="https://"+registry_url+":"+Port
-    url=url_short+"/v2/_catalog"    
+        'Accept': 'application/json'
+    }
+    if token is not None:
+        headers['Authorization'] = "Bearer "+token
+
+    url_short=_base_url(registry_url, Port)
+    url=url_short+"/v2/_catalog"
 
     if debug:
         log_python_request_curl_transform("GET",url,headers)
+
     response = requests.get(url, headers=headers)
-    #print(response.text)
-    #print(headers)
-    # Check if the response was successful
-    if response.status_code == 200:
+    if response.status_code != 200:
+        printstderr(f"Failed to get images: {response.status_code}")
+        return None
+
+    try:
         images = json.loads(response.text)
-        #print("headers: ",response.headers)
-        #print(response.headers["Link"])
-        while more_image:
-            if "Link" in response.headers.keys():
-                next_re=re.search('<(.*)>',response.headers["Link"]) 
-            else:
-                next_re=None
-            if next_re:
-                next_path=next_re.group(1)
-                url=url_short+next_path
-                response = requests.get(url, headers=headers)
-                if response.status_code == 200:
-                    images_next = json.loads(response.text)
-                    #images=images+images_next
-                    #print(images_next)
-                    images["repositories"]=images["repositories"]+images_next["repositories"]
-                    #images.update(images_next)
-                else:
-                    print("Failed to get next images:", response.status_code)
-            else:
-                more_image=0 
-                #print(images["repositories"])     
-    else:
-        print("Failed to get images:", response.status_code)
-    return(images)
+    except json.JSONDecodeError:
+        printstderr("Failed to parse JSON response")
+        return None
 
-def fetch_catalog_v2_token(registry_url,Port,token):
-    # Set the headers with authentication
-    more_image=1
+    while "Link" in response.headers:
+        next_re = re.search(r'<(.*)>', response.headers["Link"])
+        if not next_re:
+            break
+        url = url_short + next_re.group(1)
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            printstderr(f"Failed to get next images: {response.status_code}")
+            break
+        images_next = json.loads(response.text)
+        images["repositories"] = images["repositories"] + images_next.get("repositories", [])
 
-    # if we have a token try to use it in the headers
-    if token!=None:
-        headers = {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'Authorization': "Bearer "+token
-        }    
-    else:
-        headers = {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        }    
+    return images
 
-    url_short="https://"+registry_url+":"+Port
-    url=url_short+"/v2/_catalog"    
- 
-    response = requests.get(url, headers=headers)
-    #print(response.text)
-    #print(headers)
-    # Check if the response was successful
-    if response.status_code == 200:
-        try:
-            images = json.loads(response.text)
-        except json.JSONDecodeError:
-            printstderr("Failed to parse JSON response")
-            exit(1)
-        #print("headers: ",response.headers)
-        #print(response.headers["Link"])
-        while more_image:
-            if "Link" in response.headers.keys():
-                next_re=re.search('<(.*)>',response.headers["Link"]) 
-            else:
-                next_re=None
-            if next_re:
-                next_path=next_re.group(1)
-                url=url_short+next_path
-                response = requests.get(url, headers=headers)
-                if response.status_code == 200:
-                    images_next = json.loads(response.text)
-                    #images=images+images_next
-                    #print(images_next)
-                    images["repositories"]=images["repositories"]+images_next["repositories"]
-                    #images.update(images_next)
-                else:
-                    print("Failed to get next images:", response.status_code)
-            else:
-                more_image=0 
-                #print(images["repositories"])     
-    else:
-        print("Failed to get images:", response.status_code)
-    return(images)
+
+def fetch_catalog_v2_token(registry_url,Port,token=None):
+    """Backward-compatible wrapper: anonymous (token=None) or token-based catalog."""
+    return fetch_catalog_v2(registry_url, None, None, Port, token)
+
 
 
 
@@ -433,7 +398,6 @@ def get_tag_image(registry_url, username, password,Port,token,imageName):
         printstderr("# get_tag_image")
     # Set the headers with authentication
     images=None
-    auth = (username, password)
     headers = {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
@@ -455,11 +419,8 @@ def get_tag_image(registry_url, username, password,Port,token,imageName):
 
 
 def get_blob(registry_url, username, password,Port,token,imageName,digest):
-    m=None
     found=0
-    manifestListDigest=None
     blob=""
-    auth = (username, password)
 
     for blob_type in [ 'application/vnd.docker.container.image.v1+json',
                        'application/vnd.docker.image.rootfs.diff.tar.gzip',
@@ -490,7 +451,6 @@ def get_manifestlist(registry_url, username, password,Port,token,imageName,diges
     found=0
     manifestListDigest=None
     manifestReturned=""
-    auth = (username, password)
 
     for manifest_type in [ 'application/vnd.docker.distribution.manifest.list.v2+json',
                            'application/vnd.docker.distribution.manifest.v2+json',
@@ -523,7 +483,6 @@ def get_manifest_list_image_digest(registry_url, username, password,Port,token,i
     found=0
     manifestListDigest=None
     manifestReturned=""
-    auth = (username, password)
 
     for manifest_type in [ 'application/vnd.docker.distribution.manifest.list.v2+json',
                            'application/vnd.docker.distribution.manifest.v2+json',
@@ -663,9 +622,59 @@ def setapikeyvalue(registry_url,Port,token,apipath,key,value):
 
 
     
+def _abort_on_ctrl_c(sig, frame):
+    sys.stderr.write("\nAborted: nothing was deleted.\n")
+    sys.stderr.flush()
+    sys.exit(EXIT_ABORTED)
+
+
+def delete_all_countdown(registry_url, Port, seconds=DELETE_ALL_COUNTDOWN):
+    """Warn about the destructive action and give the user time to abort.
+
+    The countdown is written on stderr and refreshed in place when stderr is a
+    terminal. Ctrl+C exits with code 130 before any request is sent. The
+    previous SIGINT handler is restored afterwards.
+    """
+    target = f"https://{registry_url}:{Port}"
+    printstderr(f"About to delete ALL repositories of {target} in {seconds} seconds.")
+    printstderr("Press Ctrl+C to abort.")
+
+    previous_handler = None
+    try:
+        previous_handler = signal.signal(signal.SIGINT, _abort_on_ctrl_c)
+    except (ValueError, OSError):
+        # Not in the main thread: keep the current handler.
+        pass
+
+    interactive = sys.stderr.isatty()
+    try:
+        for remaining in range(seconds, 0, -1):
+            line = f"  {remaining:2d}s remaining before deletion... (Ctrl+C to abort)"
+            if interactive:
+                sys.stderr.write("\r" + line)
+            else:
+                sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+            time.sleep(1)
+        if interactive:
+            sys.stderr.write("\r" + " " * 70 + "\r")
+        sys.stderr.write("Starting deletion now.\n")
+        sys.stderr.flush()
+    except KeyboardInterrupt:
+        sys.stderr.write("\nAborted: nothing was deleted.\n")
+        sys.stderr.flush()
+        sys.exit(EXIT_ABORTED)
+    finally:
+        if previous_handler is not None:
+            signal.signal(signal.SIGINT, previous_handler)
+
+
 def deleteallrepo(registry_url,username,password,Port,token):
     tokenuserpass=getToken(registry_url, username, password,Port)
     images=fetch_catalog_v2(registry_url, username, password,Port,tokenuserpass)
+    if images is None:
+        printstderr("No images has been found")
+        return(0)
     for image in sorted(images["repositories"]):
         print(image)
         deleterepo(registry_url,Port,image,token)
@@ -962,6 +971,43 @@ def cmd_mirror_get(registry_url, Port, imageName, username=None, password=None, 
         print("  (other keys: %s)" % ", ".join(sorted(extra)))
     if SHOW_SECRETS is False:
         print("  [upstream login masked; --show-secrets to reveal -- it is the LDAP service account]")
+
+    # ---- GC / retention (auto-prune) ----
+    # Quay's garbage collection runs cluster-wide and the API exposes NO
+    # per-repository GC timestamp. The per-repository GC signal is the
+    # auto-prune (retention) policy, which decides which tags are eventually
+    # pruned, plus the repository state (MARKED_FOR_DELETION = queued for GC).
+    repo_path = quote(imageName.strip("/"), safe='/')
+    org_name = imageName.split("/", 1)[0]
+    print("")
+    print("### garbage collection / retention (auto-prune)")
+    for label, path in (
+        ("repository", "/api/v1/repository/" + repo_path + "/autoprunepolicy/"),
+        ("organization", "/api/v1/organization/" + quote(org_name, safe='/') + "/autoprunepolicy/"),
+    ):
+        r = api_get(registry_url, Port, path, username, password, token)
+        if r.status_code == 200:
+            try:
+                policies = r.json().get("policies") or []
+            except ValueError:
+                policies = []
+            if not policies:
+                print("  %s policies: none" % label)
+            else:
+                print("  %s policies:" % label)
+                for pol in policies:
+                    print("    - uuid=%s method=%s value=%s tagPattern=%r tagPatternMatches=%s"
+                          % (pol.get("uuid"), pol.get("method"), pol.get("value"),
+                             pol.get("tagPattern"), pol.get("tagPatternMatches")))
+        elif r.status_code == 404:
+            print("  %s policies: unavailable (auto-prune disabled, no permission, "
+                  "or namespace is not an organization)" % label)
+        elif r.status_code == 0:
+            print("  %s policies: not queried (no /api/v1 credential)" % label)
+        else:
+            print("  %s policies: HTTP %d" % (label, r.status_code))
+    print("  note: GC is cluster-wide; the API exposes no per-repository GC timestamp.")
+    print("        state=MARKED_FOR_DELETION (see repo-view) means queued for GC.")
     return m
 
 
@@ -1602,12 +1648,12 @@ def display_help():
     print("  list-all                        : list all image, tag and digest ")
     print("  get-image-manifest              : fetch manifest JSON for an image <-i imagename> <-D digest> required")
     print("  get-image-digest                : give the digest of an image <-i imagename> and <-t tag> required ")
-    print("  get-manifest                    : fetch the manifest from an image <-i imagename> <-D digest> required ")
     print("  get-blob                        : fetch a blob for an image <-i imagename> <-D digest> required")
     print("  delete-repo                     : delete one repository <-i imagename> required")
     print("  delete-tag                      : delete one tag <-i imagename> <-t tag> required")
-    print("  delete-all-repo                 : delete all repositories (requires --i-am-deleting-all-repo)")
+    print("  delete-all-repo                 : delete all repositories after a 10s countdown (requires --i-am-deleting-all-repo)")
     print("  set-api-key-value               : set one key=value on an API path <-a apipath> <-K key> <-V value> required")
+    print("  interactive                     : browse repositories, tags, manifests and blobs in a ncurses UI")
     print("")
     print("  ## READ-ONLY QUAY MIRRORING API (this fork; no credentials are printed)      ##")
     print("  quay-config                     : effective runtime config from public /config (no auth) [-r]")
@@ -1615,7 +1661,7 @@ def display_help():
     print("  list-org-repos                  : list repos of an org <-o org> (Quay way: /v2/_catalog is EMPTY)")
     print("  org-robots                      : list the robots of an org <-o org> (mirroring robots)")
     print("  repo-view                       : repo view: gives state NORMAL/MIRROR <-i org/repo>")
-    print("  mirror-get                      : mirror config of ONE repo <-i org/repo> (sync_status, external_reference, robot)")
+    print("  mirror-get                      : mirror config + GC/retention policies of ONE repo <-i org/repo>")
     print("  mirror-scan                     : per-repo mirror inventory of an org <-o org>")
     print("                                    + HEALTH / PERIMETRE / ROBOTS aggregates  [--only-problems] [--max-repos N]")
     print("  org-exists                      : ORACLE (anonymous) <-o? no, --orgs a,b,c>")
@@ -1657,6 +1703,8 @@ def display_help():
     print("  <-d>                    : for debugging purpose")
     print("")
     print("Special Options")
+    print("  -h, --help                   : show this help, or the help of one command")
+    print("                                  (e.g. quayregistryclient mirror-scan -h)")
     print("  --generate-completion        : generate bash completion script and exit")
     print("                                  (source the output to enable tab completion)")
 
@@ -1786,6 +1834,27 @@ _get_options_for_command() {
         get-server-certificate)
             echo "-r -P -d -h"
             ;;
+        quay-config)
+            echo "-r -P -d -h"
+            ;;
+        whoami)
+            echo "-r -P -u -p -T -d --show-secrets -h"
+            ;;
+        list-org-repos|org-robots)
+            echo "-r -P -o -u -p -T -d --show-secrets -h"
+            ;;
+        repo-view|mirror-get)
+            echo "-r -P -i -u -p -T -d --show-secrets -h"
+            ;;
+        mirror-scan)
+            echo "-r -P -o -u -p -T -d --show-secrets --only-problems --max-repos --offset -h"
+            ;;
+        search-v1)
+            echo "-r -P -q --pages --desc -u -p -T -d -h"
+            ;;
+        org-exists)
+            echo "-r -P --orgs -d -h"
+            ;;
         *)
             echo "-r -P -u -p -i -t -T -D -a -K -V -d -h"
             ;;
@@ -1888,13 +1957,27 @@ _get_token() {
     local port="$2"
     local username="$3"
     local password="$4"
-    local config_file="${HOME}/.docker/config.json"
+
+    # 1. An explicit API/registry token wins (same variable as the tool).
+    if [[ -n "${QRC_TOKEN:-}" ]]; then
+        echo "${QRC_TOKEN}"
+        return 0
+    fi
+
+    # 2. Credentials from the environment, then from the credential stores,
+    #    in the same order as lookup_credentials() in the tool.
+    username="${username:-${QRC_USERNAME:-}}"
+    password="${password:-${QRC_PASSWORD:-}}"
 
     if [[ -z "${username}" || -z "${password}" ]]; then
-        if [[ -f "${config_file}" ]]; then
-            local creds
+        local candidate creds
+        for candidate in "${REGISTRY_AUTH_FILE:-}" \
+                         "${XDG_RUNTIME_DIR:-}/containers/auth.json" \
+                         "${HOME}/.config/containers/auth.json" \
+                         "${HOME}/.docker/config.json"; do
+            [[ -n "${candidate}" && -f "${candidate}" ]] || continue
             # SECURITY: path + registry via the environment, not the command line.
-            creds=$(QRC_COMPL_CONFIG="${config_file}" QRC_COMPL_REGISTRY="${registry}" \
+            creds=$(QRC_COMPL_CONFIG="${candidate}" QRC_COMPL_REGISTRY="${registry}" \
                     QRC_COMPL_PORT="${port}" python3 -c '
 import os, json, base64, sys
 try:
@@ -1921,8 +2004,9 @@ sys.exit(1)
             if [[ $? -eq 0 && -n "${creds}" ]]; then
                 username="${creds%%:*}"
                 password="${creds#*:}"
+                break
             fi
-        fi
+        done
     fi
 
     if [[ -n "${username}" && -n "${password}" ]]; then
@@ -1957,6 +2041,71 @@ complete -F _quayregistryclient quayregistryclient
     print(completion_script)
 
 
+SUBCOMMAND_DESCRIPTIONS = {
+    'list-catalog': 'List every repository present in the registry.',
+    'list-tags': 'List every tag of a repository.',
+    'list-all': 'List every repository with its tags and digests.',
+    'get-image-digest': 'Print the manifest digest of a given tag.',
+    'get-image-manifest': 'Print the manifest JSON for a digest.',
+    'get-blob': 'Print the content of a blob (config or layer).',
+    'delete-repo': 'Delete a whole repository.',
+    'delete-tag': 'Delete a single tag.',
+    'delete-all-repo': 'DESTRUCTIVE: delete every repository in the registry.',
+    'browse-api': 'GET an arbitrary Quay API path and print the (redacted) JSON answer.',
+    'quay-api-discovery': 'Call GET /api/v1/discovery and print the JSON answer.',
+    'quay-api-listuser': 'List every user (superuser API).',
+    'quay-api-delete-user': 'Delete a user (superuser API).',
+    'quay-api-create-user': 'Create a user (superuser API).',
+    'quay-api-change-userpassword': 'Change a user password (superuser API).',
+    'set-api-key-value': 'POST a single key/value pair on an API path.',
+    'get-server-certificate': 'Print the TLS certificate chain served by the registry.',
+    'quay-config': 'Print the effective runtime config from the public /config endpoint.',
+    'whoami': 'Show which identity the credential resolves to (LDAP user vs robot).',
+    'list-org-repos': 'List the repositories of an organization.',
+    'org-robots': 'List the robot accounts of an organization.',
+    'repo-view': 'Repository view: state NORMAL/MIRROR, description, tags.',
+    'mirror-get': 'Mirror config + GC/retention policies of ONE repository.',
+    'mirror-scan': 'Per-repo mirror inventory of an org with health/perimeter/robot aggregates.',
+    'search-v1': 'Registry V1 search (what `podman search` calls).',
+    'org-exists': 'Probe candidate organization names (200=exists / 404=absent).',
+    'interactive': 'Browse repositories, tags and blobs in a ncurses UI.',
+}
+
+OPTION_HELP = {
+    'registry_url': 'Registry URL (e.g., quay.io, myregistry.local)',
+    'port': 'TCP port (default: 443)',
+    'username': 'Registry username',
+    'password': 'Registry password',
+    'image_name': 'Image name (e.g., myorg/myapp)',
+    'tag': 'Tag name (default: latest)',
+    'token': 'Quay OAuth access token (-T) for /api/v1',
+    'digest': 'Image digest (sha256:...)',
+    'apipath': 'API path (e.g., /api/v1/user/)',
+    'key': 'Key for set-api-key-value',
+    'value': 'Value for set-api-key-value',
+    'i_am_deleting_all_repo': 'Required confirmation flag for delete-all-repo',
+    'debug': 'Enable debug mode',
+    'show_secrets': 'Do not redact secrets in the output (default: masked)',
+    'org': 'Organization name (e.g., myorg)',
+    'only_problems': 'Only show repositories whose mirror is not healthy',
+    'max_repos': 'Limit the number of repositories inspected (0 = all)',
+    'offset': 'Skip the first N repositories (chunk long scans)',
+    'query': 'Search term (empty = all)',
+    'pages': 'Maximum number of pages (0 = all)',
+    'desc': 'Show descriptions in search results',
+    'orgs': 'Comma-separated candidate organization names',
+}
+
+
+def _apply_subcommand_help(subparsers):
+    """Give every sub-command a description and per-option help text."""
+    for name, sp in subparsers.choices.items():
+        sp.description = SUBCOMMAND_DESCRIPTIONS.get(name, '')
+        for action in sp._actions:
+            if action.dest in OPTION_HELP and not action.help:
+                action.help = OPTION_HELP[action.dest]
+
+
 def create_parser():
     parser = argparse.ArgumentParser(
         prog='quayregistryclient',
@@ -1978,17 +2127,18 @@ def create_parser():
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--generate-completion', action='store_true', help='Generate bash completion script and exit')
     parser.add_argument('--i-am-deleting-all-repo', action='store_true', help='Required for delete-all-repo command')
+    parser.add_argument('-h', '--help', action='store_true', help='Show this help message and exit')
 
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
-    sp_catalog = subparsers.add_parser('list-catalog', help='List all images in the registry', add_help=False)
+    sp_catalog = subparsers.add_parser('list-catalog', help='List all images in the registry')
     sp_catalog.add_argument('-r', '--registry-url', required=True)
     sp_catalog.add_argument('-P', '--port', default='443')
     sp_catalog.add_argument('-u', '--username')
     sp_catalog.add_argument('-p', '--password')
     sp_catalog.add_argument('-d', '--debug', action='store_true')
 
-    sp_tags = subparsers.add_parser('list-tags', help='List all tags for an image', add_help=False)
+    sp_tags = subparsers.add_parser('list-tags', help='List all tags for an image')
     sp_tags.add_argument('-r', '--registry-url', required=True)
     sp_tags.add_argument('-P', '--port', default='443')
     sp_tags.add_argument('-u', '--username')
@@ -1996,14 +2146,14 @@ def create_parser():
     sp_tags.add_argument('-i', '--image-name', required=True)
     sp_tags.add_argument('-d', '--debug', action='store_true')
 
-    sp_all = subparsers.add_parser('list-all', help='List all images, tags and digests', add_help=False)
+    sp_all = subparsers.add_parser('list-all', help='List all images, tags and digests')
     sp_all.add_argument('-r', '--registry-url', required=True)
     sp_all.add_argument('-P', '--port', default='443')
     sp_all.add_argument('-u', '--username')
     sp_all.add_argument('-p', '--password')
     sp_all.add_argument('-d', '--debug', action='store_true')
 
-    sp_digest = subparsers.add_parser('get-image-digest', help='Get the digest of an image', add_help=False)
+    sp_digest = subparsers.add_parser('get-image-digest', help='Get the digest of an image')
     sp_digest.add_argument('-r', '--registry-url', required=True)
     sp_digest.add_argument('-P', '--port', default='443')
     sp_digest.add_argument('-u', '--username')
@@ -2012,7 +2162,7 @@ def create_parser():
     sp_digest.add_argument('-t', '--tag', default='latest')
     sp_digest.add_argument('-d', '--debug', action='store_true')
 
-    sp_manifest = subparsers.add_parser('get-image-manifest', help='Get the manifest JSON for an image', add_help=False)
+    sp_manifest = subparsers.add_parser('get-image-manifest', help='Get the manifest JSON for an image')
     sp_manifest.add_argument('-r', '--registry-url', required=True)
     sp_manifest.add_argument('-P', '--port', default='443')
     sp_manifest.add_argument('-u', '--username')
@@ -2021,7 +2171,7 @@ def create_parser():
     sp_manifest.add_argument('-D', '--digest', required=True)
     sp_manifest.add_argument('-d', '--debug', action='store_true')
 
-    sp_blob = subparsers.add_parser('get-blob', help='Get a blob for an image', add_help=False)
+    sp_blob = subparsers.add_parser('get-blob', help='Get a blob for an image')
     sp_blob.add_argument('-r', '--registry-url', required=True)
     sp_blob.add_argument('-P', '--port', default='443')
     sp_blob.add_argument('-u', '--username')
@@ -2030,14 +2180,14 @@ def create_parser():
     sp_blob.add_argument('-D', '--digest', required=True)
     sp_blob.add_argument('-d', '--debug', action='store_true')
 
-    sp_delrepo = subparsers.add_parser('delete-repo', help='Delete a repository', add_help=False)
+    sp_delrepo = subparsers.add_parser('delete-repo', help='Delete a repository')
     sp_delrepo.add_argument('-r', '--registry-url', required=True)
     sp_delrepo.add_argument('-P', '--port', default='443')
     sp_delrepo.add_argument('-i', '--image-name', required=True)
     sp_delrepo.add_argument('-T', '--token', required=True)
     sp_delrepo.add_argument('-d', '--debug', action='store_true')
 
-    sp_deltag = subparsers.add_parser('delete-tag', help='Delete a tag', add_help=False)
+    sp_deltag = subparsers.add_parser('delete-tag', help='Delete a tag')
     sp_deltag.add_argument('-r', '--registry-url', required=True)
     sp_deltag.add_argument('-P', '--port', default='443')
     sp_deltag.add_argument('-i', '--image-name', required=True)
@@ -2045,7 +2195,7 @@ def create_parser():
     sp_deltag.add_argument('-T', '--token', required=True)
     sp_deltag.add_argument('-d', '--debug', action='store_true')
 
-    sp_delall = subparsers.add_parser('delete-all-repo', help='Delete all repositories (destructive)', add_help=False)
+    sp_delall = subparsers.add_parser('delete-all-repo', help='Delete all repositories (destructive)')
     sp_delall.add_argument('-r', '--registry-url', required=True)
     sp_delall.add_argument('-P', '--port', default='443')
     sp_delall.add_argument('-u', '--username')
@@ -2054,7 +2204,7 @@ def create_parser():
     sp_delall.add_argument('--i-am-deleting-all-repo', action='store_true')
     sp_delall.add_argument('-d', '--debug', action='store_true')
 
-    sp_browse = subparsers.add_parser('browse-api', help='Query Quay API and display JSON', add_help=False)
+    sp_browse = subparsers.add_parser('browse-api', help='Query Quay API and display JSON')
     sp_browse.add_argument('-r', '--registry-url', required=True)
     sp_browse.add_argument('-P', '--port', default='443')
     sp_browse.add_argument('-T', '--token', required=True)
@@ -2063,7 +2213,7 @@ def create_parser():
     sp_browse.add_argument('--show-secrets', action='store_true',
                            help='do not redact secrets in the API response')
 
-    sp_discovery = subparsers.add_parser('quay-api-discovery', help='Query Quay API discovery endpoint', add_help=False)
+    sp_discovery = subparsers.add_parser('quay-api-discovery', help='Query Quay API discovery endpoint')
     sp_discovery.add_argument('-r', '--registry-url', required=True)
     sp_discovery.add_argument('-P', '--port', default='443')
     sp_discovery.add_argument('-T', '--token', required=True)
@@ -2071,7 +2221,7 @@ def create_parser():
     sp_discovery.add_argument('--show-secrets', action='store_true',
                               help='do not redact secrets in the API response')
 
-    sp_listuser = subparsers.add_parser('quay-api-listuser', help='List Quay users via superuser API', add_help=False)
+    sp_listuser = subparsers.add_parser('quay-api-listuser', help='List Quay users via superuser API')
     sp_listuser.add_argument('-r', '--registry-url', required=True)
     sp_listuser.add_argument('-P', '--port', default='443')
     sp_listuser.add_argument('-T', '--token', required=True)
@@ -2079,21 +2229,21 @@ def create_parser():
     sp_listuser.add_argument('--show-secrets', action='store_true',
                              help='do not redact secrets in the API response')
 
-    sp_deluser = subparsers.add_parser('quay-api-delete-user', help='Delete a Quay user via superuser API', add_help=False)
+    sp_deluser = subparsers.add_parser('quay-api-delete-user', help='Delete a Quay user via superuser API')
     sp_deluser.add_argument('-r', '--registry-url', required=True)
     sp_deluser.add_argument('-P', '--port', default='443')
     sp_deluser.add_argument('-T', '--token', required=True)
     sp_deluser.add_argument('-u', '--username', required=True)
     sp_deluser.add_argument('-d', '--debug', action='store_true')
 
-    sp_createuser = subparsers.add_parser('quay-api-create-user', help='Create a Quay user via superuser API', add_help=False)
+    sp_createuser = subparsers.add_parser('quay-api-create-user', help='Create a Quay user via superuser API')
     sp_createuser.add_argument('-r', '--registry-url', required=True)
     sp_createuser.add_argument('-P', '--port', default='443')
     sp_createuser.add_argument('-T', '--token', required=True)
     sp_createuser.add_argument('-u', '--username', required=True)
     sp_createuser.add_argument('-d', '--debug', action='store_true')
 
-    sp_changepwd = subparsers.add_parser('quay-api-change-userpassword', help='Change Quay user password via superuser API', add_help=False)
+    sp_changepwd = subparsers.add_parser('quay-api-change-userpassword', help='Change Quay user password via superuser API')
     sp_changepwd.add_argument('-r', '--registry-url', required=True)
     sp_changepwd.add_argument('-P', '--port', default='443')
     sp_changepwd.add_argument('-T', '--token', required=True)
@@ -2101,7 +2251,7 @@ def create_parser():
     sp_changepwd.add_argument('-p', '--password', required=True)
     sp_changepwd.add_argument('-d', '--debug', action='store_true')
 
-    sp_setkey = subparsers.add_parser('set-api-key-value', help='Set key=value on an API path', add_help=False)
+    sp_setkey = subparsers.add_parser('set-api-key-value', help='Set key=value on an API path')
     sp_setkey.add_argument('-r', '--registry-url', required=True)
     sp_setkey.add_argument('-P', '--port', default='443')
     sp_setkey.add_argument('-T', '--token', required=True)
@@ -2110,7 +2260,7 @@ def create_parser():
     sp_setkey.add_argument('-V', '--value', required=True)
     sp_setkey.add_argument('-d', '--debug', action='store_true')
 
-    sp_cert = subparsers.add_parser('get-server-certificate', help='Display the server SSL certificate', add_help=False)
+    sp_cert = subparsers.add_parser('get-server-certificate', help='Display the server SSL certificate')
     sp_cert.add_argument('-r', '--registry-url', required=True)
     sp_cert.add_argument('-P', '--port', default='443')
     sp_cert.add_argument('-d', '--debug', action='store_true')
@@ -2127,7 +2277,7 @@ def create_parser():
         ('search-v1', 'registry V1 search (what `podman search` calls) - the working enumeration here'),
         ('org-exists', 'ORACLE (anonymous): probe candidate org names, 200=exists / 404=absent'),
     ]:
-        sp = subparsers.add_parser(name, help=hlp, add_help=False)
+        sp = subparsers.add_parser(name, help=hlp)
         sp.add_argument('-r', '--registry-url', required=True)
         sp.add_argument('-P', '--port', default='443')
         sp.add_argument('-u', '--username')
@@ -2155,18 +2305,16 @@ def create_parser():
             sp.add_argument('--orgs', default='',
                             help='comma-separated candidate org names (required; no default)')
 
-    sp_interactive = subparsers.add_parser('interactive', help='Launch interactive ncurses interface', add_help=False)
+    sp_interactive = subparsers.add_parser('interactive', help='Launch interactive ncurses interface')
     sp_interactive.add_argument('-r', '--registry-url', required=True)
     sp_interactive.add_argument('-P', '--port', default='443')
     sp_interactive.add_argument('-u', '--username')
     sp_interactive.add_argument('-p', '--password')
     sp_interactive.add_argument('-d', '--debug', action='store_true')
 
+    _apply_subcommand_help(subparsers)
+
     return parser
-
-import curses
-import json
-
 
 class TreeNode:
     def __init__(self, name, node_type, parent=None, data=None):
@@ -2402,7 +2550,7 @@ class QueryLoop:
                             for layer in manifest.get("layers", []):
                                 total_size += layer.get("size", 0)
             return total_size if total_size > 0 else None
-        except Exception as e:
+        except Exception:
             return None
 
     def fetch_manifest(self, repo_name, digest):
@@ -2778,15 +2926,15 @@ class QueryLoop:
 def main():
     parser = create_parser()
 
-    if len(sys.argv) > 1 and sys.argv[1] == '--help' and len(sys.argv) == 2:
-        display_help()
-        sys.exit(0)
-
     if len(sys.argv) == 1:
         display_help()
         sys.exit(0)
 
     args, unknown = parser.parse_known_args()
+
+    if args.help:
+        display_help()
+        sys.exit(0)
 
     if args.generate_completion:
         generate_bash_completion()
@@ -3014,6 +3162,7 @@ def main():
             token_val="##maskingToken##" if token is not None else token
             print(f"Error: missing parameters delete-all-repo(registry_url={registry_url},Port={Port},token={token_val})")
             sys.exit(2)
+        delete_all_countdown(registry_url, Port)
         deleteallrepo(registry_url, username, password,Port,token)
     # ================= fork: read-only Quay mirroring API commands =================
     elif cmd == "quay-config":
