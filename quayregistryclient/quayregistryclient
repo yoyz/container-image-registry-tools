@@ -3,7 +3,7 @@
 
 
 
-from urllib.parse import urlencode, quote_plus
+from urllib.parse import urlencode, quote_plus, quote
 import requests, json, argparse, sys, hashlib, re, signal,ssl, socket, os, base64
 
 DEFAULT_PORT=443
@@ -81,14 +81,22 @@ def checkhttpsconnection(registry_url, port):
         printstderr(f"An unrelated error occurred: {e}")
         return(0)
     
-def checkssl(registry_url,Port):
-    cert_pem = ssl.get_server_certificate((registry_url,Port))
 
 def log_python_request_curl_transform(method, url, headers, data=None):
-    curl_cmd = f"curl -X {method} '{url}' -H 'Content-Type: application/json' -H 'Accept: application/json' -H 'Authorization: Bearer {headers['Authorization'].split(' ')[1]}'"
+    # SECURITY FIX (fork): the original interpolated the FULL Authorization
+    # header -- a live Bearer token (measured here: 966 chars) -- into STDOUT.
+    # That leaks the credential into terminal scrollback, any tee/> redirect and
+    # any CI log, and pollutes the command's own data output. Mask + go to stderr.
+    _auth = (headers or {}).get('Authorization', '')
+    _kind, _, _val = _auth.partition(' ')
+    _masked = ('%s <masked:%d chars>' % (_kind or 'Basic', len(_val))) if _auth else 'none'
+    curl_cmd = 'curl -X %s %r -H "Accept: application/json" -H "Authorization: %s"' % (
+        method, url, _masked)
     if data:
-        curl_cmd += f" -d '{data}'"
-    print(f"# {curl_cmd}")
+        curl_cmd += " -d '%s'" % re.sub(
+            r'((?:password|secret|token|credential|api_key)"\s*:\s*")[^"]*"',
+            r'\1[MASKED]"', str(data))
+    printstderr('# ' + curl_cmd)   # STDERR: stdout must stay pure data
     #response = requests.request(method, url, headers=headers, data=data)
     #return response
     
@@ -110,7 +118,7 @@ def quayapidiscovery(registry_url,Port,token):
     if debug:
         log_python_request_curl_transform("GET",url,headers)
     response = requests.get(url, headers=headers)
-    print(response.text)
+    print_api_response(response)
     
 def browseapi(registry_url,Port,token,apipath):
     if debug:
@@ -133,7 +141,7 @@ def browseapi(registry_url,Port,token,apipath):
     if debug:
         log_python_request_curl_transform("GET",url,headers)    
     response = requests.get(url, headers=headers)
-    print(response.text)
+    print_api_response(response)
     
 
 def quayapi_delete_api_v1_superuser_users(registry_url,Port,token,username):
@@ -157,11 +165,11 @@ def quayapi_delete_api_v1_superuser_users(registry_url,Port,token,username):
     if debug:
         log_python_request_curl_transform("DELETE",url,headers)    
     response = requests.delete(url, headers=headers)
-    print(response.text)
+    print_api_response(response)
 
 def quayapi_post_api_v1_superuser_users(registry_url,Port,token,username):
     if debug:
-        printstderr("# quayapi_delete_api_v1_superuser_users")
+        printstderr("# quayapi_post_api_v1_superuser_users")
     if checkhttpsconnection(registry_url,Port)==0:
         return(0)
     apipath="/api/v1/superuser/users/"
@@ -181,7 +189,7 @@ def quayapi_post_api_v1_superuser_users(registry_url,Port,token,username):
     if debug:
         log_python_request_curl_transform("POST",url,headers)    
     response = requests.post(url, headers=headers, json=payload)
-    print(response.text)
+    print_api_response(response)
 
 def quayapi_put_api_v1_superuser_users(registry_url,Port,token,username,password):
     if debug:
@@ -203,7 +211,7 @@ def quayapi_put_api_v1_superuser_users(registry_url,Port,token,username,password
     if debug:
         log_python_request_curl_transform("PUT",url,headers)    
     response = requests.put(url, headers=headers, json=payload)
-    print(response.text)
+    print_api_response(response)
 
     
 
@@ -309,25 +317,6 @@ def getblob(registry_url, username, password,Port,imageName,digest):
     blob=get_blob(registry_url, username, password,Port,token2,imageName,digest)
     print(blob, end="")
 
-    
-
-def listdigest(registry_url, username, password,Port,imageName,token):
-    if debug:
-        printstderr("# listdigest")
-    headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': "Bearer "+token
-    }    
-    url_short="https://"+registry_url+":"+Port
-    url=url_short+"/api/v1/repository/adminadmin/"+imageName+"/manifest"
-    if debug:
-        log_python_request_curl_transform("GET",url,headers)        
-    response = requests.get(url, headers=headers)
-    print(response)
-    #print(json.loads(response.text))
-    #print(response.read())
-    
 def fetch_catalog_v2(registry_url, username, password,Port,token):
     if debug:
         printstderr("# fetch_catalog_v2")
@@ -565,44 +554,58 @@ def get_manifest_list_image_digest(registry_url, username, password,Port,token,i
         )
     return manifestListDigest
 
-    if (found == 0):
-        print("Failed to get images, status_code: %d header: %s, manifestReturned: %s" % ( response.status_code, response.header, manifestReturned))
-    return(manifestListDigest)
-
 
 def getToken(registry_url, username, password,Port):
     token=None
-    auth = (username, password)
-    headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' }
-    options=  {'account': username , 'service' : registry_url+":"+Port }
-    
+    # FIX: was auth=(username,password) -> requests encodes Basic with LATIN-1;
+    # a password with any non-ASCII byte then differs from what podman/docker
+    # send (UTF-8) and Quay answers 401 'Invalid username or password'.
+    headers = { 'Content-Type': 'application/json', 'Accept': 'application/json',
+                'Authorization': basic_header(username, password) }
+    # FIX: Quay advertises service="<host>" WITHOUT the port in WWW-Authenticate.
+    # Appending ":"+Port made the token request mismatch the advertised service.
+    options=  {'account': username , 'service' : registry_url }
+
     options_urlencoded=urlencode(options)
-    url="https://"+registry_url+":"+Port+"/v2/auth?"+options_urlencoded
-    #print(url)
-    response = requests.get(url, auth=auth, headers=headers)
+    url=_base_url(registry_url,Port)+"/v2/auth?"+options_urlencoded
+    if debug:
+        # SECURITY: never echo the raw URL -- it carries account=<login>, which
+        # IS a credential on a robot/LDAP account. Mask every query value.
+        safe_url = re.sub(r'(account|service|scope)=([^&]*)',
+                          lambda m: "%s=<masked:%d>" % (m.group(1), len(m.group(2))),
+                          url)
+        printstderr("# token request: " + safe_url)
+    response = requests.get(url, headers=headers)
     if response.status_code == 200:
        json_token = json.loads(response.text)
        token=json_token["token"]
     else:
-        print("Can not get a token")
+        # FIX: the original printed only 'Can not get a token' -- useless.
+        printstderr("Can not get a token (HTTP %d): %s" % (response.status_code,
+                    (response.text or '')[:160].replace('\n',' ')))
+        if response.status_code in (401, 403):
+            printstderr("  -> the credential itself is refused by the registry.")
+            printstderr("     Verify with: podman login <registry>   (or export QRC_TOKEN=...)")
         sys.exit(3)
     return token
- 
+
 def getTokenForImageScope(registry_url, username, password,Port,imageName):
     token=None
-    auth = (username, password)
-    headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' }
-    options=  {'account': username , 'service' : registry_url+":"+Port, 'scope':'repository:'+imageName+':pull' }
-    
+    # FIX: same latin-1 Basic-auth bug as getToken().
+    headers = { 'Content-Type': 'application/json', 'Accept': 'application/json',
+                'Authorization': basic_header(username, password) }
+    # FIX: same service bug as getToken() — no port in the advertised service.
+    options=  {'account': username , 'service' : registry_url, 'scope':'repository:'+imageName+':pull' }
+
     options_urlencoded=urlencode(options)
-    url="https://"+registry_url+":"+Port+"/v2/auth?"+options_urlencoded
-    #print(url)
-    response = requests.get(url, auth=auth, headers=headers)
+    url=_base_url(registry_url,Port)+"/v2/auth?"+options_urlencoded
+    response = requests.get(url, headers=headers)
     if response.status_code == 200:
        json_token = json.loads(response.text)
        token=json_token["token"]
     else:
-        print("Can not get a token")
+        printstderr("Can not get a token for scope repository:%s:pull (HTTP %d): %s" % (
+            imageName, response.status_code, (response.text or '')[:160].replace('\n',' ')))
         sys.exit(3)
     return token
  
@@ -652,7 +655,9 @@ def setapikeyvalue(registry_url,Port,token,apipath,key,value):
     url=url_short+apipath
     payload={key : value}
     if debug:
-        printstderr("setapikeyvalue: "+url+" "+json.dumps(headers)+" "+json.dumps(payload))
+        # SECURITY: was printstderr(headers + payload) -- printed the Bearer
+        # token in clear. log_python_request_curl_transform() masks both.
+        log_python_request_curl_transform("POST",url,headers,json.dumps(payload))
     response = requests.post(url, headers=headers,json=payload)
     print(response)
 
@@ -666,60 +671,918 @@ def deleteallrepo(registry_url,username,password,Port,token):
         deleterepo(registry_url,Port,image,token)
 
 
+# =============================================================================
+#  FORK ADDITIONS — read-only hard lock + Quay mirroring API helpers
+#  Rationale: /v2/_catalog is EMPTY on Quay (it is a superuser-only endpoint),
+#  so repository enumeration MUST go through /api/v1/repository?namespace=...
+#  and mirror state can only be read through the Quay API (the only place Quay
+#  decrypts external_registry_* for you).
+# =============================================================================
 
-def get_registry_password(file_path, registry_host):
-    """
-    Extracts credentials from ~/.docker/config.json or compatible files.
-    Returns: {'username': '...', 'password': '...'} or {} if not found.
-    """
-    file_path = os.path.expanduser(file_path)
-    if not os.path.exists(file_path):
-        return {}
+READ_ONLY = True          # hard lock: this fork never mutates the registry
 
+DESTRUCTIVE_COMMANDS = {
+    "delete-repo", "delete-tag", "delete-all-repo", "set-api-key-value",
+    "quay-api-create-user", "quay-api-delete-user", "quay-api-change-userpassword",
+}
+
+# Any of these in a JSON key => value is masked in the output.
+SECRET_KEY_RX = re.compile(r'(password|secret|token|credential|api_key|apikey)', re.I)
+# Quay returns these decrypted; they are the *upstream LDAP login* -> mask by default.
+CRED_FIELDS = {"external_registry_username"}
+
+SHOW_SECRETS = False
+
+
+def mask_value(v):
+    return "[REDACTED:%d chars]" % (len(v) if hasattr(v, "__len__") else 1)
+
+
+def redact(obj, _key=""):
+    """Recursively redact secrets so nothing sensitive ever reaches stdout."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if not SHOW_SECRETS and isinstance(k, str) and (
+                    SECRET_KEY_RX.search(k) or k in CRED_FIELDS):
+                out[k] = mask_value(v)
+            else:
+                out[k] = redact(v, k if isinstance(k, str) else "")
+        return out
+    if isinstance(obj, list):
+        return [redact(x, _key) for x in obj]
+    return obj
+
+
+def print_api_response(response):
+    """
+    fork: print an API response WITHOUT leaking secrets. JSON answers are
+    redacted (SECRET_KEY_RX + CRED_FIELDS) and pretty-printed; anything else
+    (HTML error page, empty body) is printed as-is. Opt-out: --show-secrets.
+    """
     try:
-        with open(file_path, 'r') as f:
-            config_json = json.load(f)
+        print(json.dumps(redact(response.json()), indent=2))
+    except ValueError:
+        print(response.text)
 
-        auths = config_json.get("auths", {})
-        
-        # Try exact match first, then try appending/removing https://
-        keys_to_try = [
-            registry_host,
-            f"https://{registry_host}",
-            f"http://{registry_host}",
-            registry_host.replace("https://", "").replace("http://", "")
-        ]
 
-        reg_data = None
-        for k in keys_to_try:
-            if k in auths:
-                reg_data = auths[k]
+def _base_url(registry_url, Port):
+    # FIX: do NOT append :443 — it is the default https port and putting it in
+    # the URL makes Quay answer 308 redirects that then break auth follow-up.
+    p = str(Port)
+    if p in ("443", "None", ""):
+        return "https://" + registry_url
+    return "https://" + registry_url + ":" + p
+
+
+RAW_BASIC = None      # fork: stored base64 replayed VERBATIM, exactly like podman
+CREDS_FROM_STORE = False  # True once credentials were auto-loaded from a file
+ALLOW_STORE_WEB_LOGIN = (os.environ.get("QRC_ALLOW_STORE_WEB_LOGIN", "1")
+                         .strip().lower() not in ("0", "false", "no"))
+
+
+def basic_header(username, password):
+    """
+    fork FIX (root cause of 'Can not get a token' while `podman search` works):
+    1) requests' HTTPBasicAuth encodes with LATIN-1, so a password holding a
+       non-ASCII byte yields different bytes than podman's UTF-8 -> 401.
+    2) Worse: the store may not hold 'login:password' at all (OAuth identity
+       token, robot token, helper placeholder). Splitting it on ':' INVENTS a
+       credential. podman never splits -- it replays the stored base64 verbatim.
+    So: if we captured the stored blob, send it byte-identical; else encode
+    UTF-8 explicitly.
+    """
+    if RAW_BASIC:
+        return "Basic " + RAW_BASIC
+    raw = ("%s:%s" % (username, password or "")).encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii")
+
+
+
+def api_get(registry_url, Port, apipath, username=None, password=None,
+            token=None, params=None, timeout=30, max_redirects=5, public=False):
+    """
+    Single authenticated GET on the Quay API. GET only — no verb override.
+    FIX: follow redirects. Quay 3.16 answers 308 to normalize missing trailing
+    slashes (e.g. /api/v1/user -> /api/v1/user/); forcing allow_redirects=False
+    broke every such endpoint.
+    Redirects here stay on the same host, so the auth header is kept; a redirect
+    that LEAVES the host is refused instead of leaking credentials.
+    """
+    url = _base_url(registry_url, Port) + apipath
+    # /api/v1 accepts ONLY an app/OAuth token, a session cookie, or a web-login
+    # session (the mode the Ansible collection uses) -- never HTTP Basic.
+    # FIX: `public=True` skips that gate: endpoints like GET /config answer
+    # anonymously and must NOT be blocked (they were, in an earlier revision
+    # of this fork -- a self-inflicted regression caught in review).
+    if public:
+        hdrs = {'Accept': 'application/json'}
+    else:
+        hdrs = api_headers_for(token, username, password, registry_url, Port)
+        if hdrs is None:
+            explain_api_auth_needed(registry_url)
+            r = _NoAuthResult()
+            return r
+    # Session reuse: a web-login session carries its cookie (and CSRF token)
+    # inside SESSION; token/cookie/anonymous modes use a fresh session.
+    if SESSION is not None and 'Authorization' not in hdrs and 'Cookie' not in hdrs and not public:
+        sess = SESSION
+        hdrs = dict(hdrs)
+        if CSRF:
+            hdrs['X-CSRF-Token'] = CSRF
+    else:
+        sess = requests.Session()
+    r = None
+    for _ in range(max_redirects):
+        r = sess.get(url, headers=hdrs, params=params, timeout=timeout,
+                     allow_redirects=False)
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("Location", "")
+            if not loc:
                 break
-        
-        if not reg_data:
-            return {}
+            from urllib.parse import urljoin, urlparse
+            nxt = urljoin(url, loc)
+            if urlparse(nxt).hostname != urlparse(url).hostname:
+                printstderr("** refusing cross-host redirect %s -> %s (credential leak guard)"
+                            % (url, nxt))
+                return r
+            if debug:
+                printstderr("# follow %d -> %s" % (r.status_code, nxt))
+            url, params = nxt, None
+            continue
+        break
+    if debug:
+        printstderr("# GET %s [%d]" % (r.url if r is not None else url,
+                                       r.status_code if r is not None else 0))
+    return r
 
-        # Handle 'auth' string (Base64 encoded "user:pass")
-        if "auth" in reg_data:
-            try:
-                decoded_auth = base64.b64decode(reg_data["auth"]).decode('utf-8')
-                if ":" in decoded_auth:
-                    username, password = decoded_auth.split(":", 1)
-                    return {"username": username, "password": password}
-            except Exception: pass
 
-        # Handle explicit keys
-        if "username" in reg_data and "password" in reg_data:
-            return {
-                "username": reg_data["username"],
-                "password": reg_data["password"]
-            }
+def describe_response(r, what=""):
+    """Human-readable status, so a 401/404 never looks like 'empty registry'."""
+    if r.status_code == 0:
+        # api_get() short-circuited: the reason was already explained. No dup.
+        return False
+    if r.status_code == 200:
+        return True
+    hint = {
+        401: "NOT AUTHENTICATED -> provide credentials (config.json, -u/-p or -T token)",
+        403: "FORBIDDEN -> authenticated but insufficient rights on this object",
+        404: "NOT FOUND -> object has no mirror config (or wrong org/repo)",
+        302: "REDIRECT -> likely an auth wall",
+    }.get(r.status_code, "unexpected status")
+    printstderr("** HTTP %d on %s : %s" % (r.status_code, what or r.url, hint))
+    body = (r.text or "").strip().replace("\n", " ")
+    if body:
+        printstderr("   body: " + body[:200])
+    return False
 
+
+def repo_full_name(entry):
+    """/api/v1/repository entries differ in shape between Quay versions."""
+    if "repository" in entry:
+        return entry["repository"]
+    ns, name = entry.get("namespace"), entry.get("name")
+    if ns and name:
+        return ns + "/" + name
+    return None
+
+
+def quay_list_org_repos(registry_url, Port, org, username=None, password=None,
+                        token=None, page_limit=200):
+    """
+    Enumerate the repositories of an org. THIS is how you enumerate a Quay:
+    /v2/_catalog returns [] on Quay unless you are a superuser.
+    Follows next_page fully (the Ansible role caps at 10 pages -- see synthese 8.6).
+    """
+    repos, pages = [], 0
+    params = {"namespace": org}
+    nxt = None
+    while True:
+        pages += 1
+        if nxt:
+            params["next_page"] = nxt
+        r = api_get(registry_url, Port, "/api/v1/repository", username, password,
+                    token, params=params)
+        if not describe_response(r, "/api/v1/repository?namespace=%s (page %d)" % (org, pages)):
+            return repos, pages, True
+        try:
+            data = r.json()
+        except ValueError:
+            printstderr("** non-JSON answer on page %d" % pages)
+            return repos, pages, True
+        for e in data.get("repositories", []):
+            full = repo_full_name(e)
+            if full:
+                repos.append(full)
+        nxt = data.get("next_page")
+        if not nxt:
+            return repos, pages, False
+        if pages >= page_limit:                      # safety net, but way above 10
+            printstderr("** page_limit %d reached for org %s -- list may be TRUNCATED"
+                        % (page_limit, org))
+            return repos, pages, True
+        params = {"namespace": org}
+
+
+def get_config(registry_url, Port):
+    """Public endpoint -> the EFFECTIVE runtime config of this Quay."""
+    # FIX: GET /config is PUBLIC on this Quay (ANONYMOUS_ACCESS=true) -> must
+    # bypass the /api/v1 credential gate.
+    r = api_get(registry_url, Port, "/config", public=True)
+    if not describe_response(r, "/config"):
+        return None
+    c = r.json()
+    f = c.get("features") or {}
+    keep_top = ("version_number", "registry_title", "server_hostname")
+    print("### effective runtime config (from GET /config, no credential needed)")
+    for k in keep_top:
+        if k in c:
+            print("  %-22s = %s" % (k, c[k]))
+    print("  %-22s =" % "auth", json.dumps(c.get("authentication", {}))[:120])
+    print("  --- mirroring-relevant features ---")
+    for k in sorted(f):
+        if re.search(r'MIRROR|SSRF|ANONYMOUS|PROXY|SUPERUSER|BROWSER', k, re.I):
+            print("  %-40s = %s" % (k, f[k]))
+    print("  --- mirroring-relevant non-feature config ---")
+    print("  ", json.dumps({k: v for k, v in c.items()
+                            if not isinstance(v, (dict, list))})[:300])
+    return c
+
+
+def whoami(registry_url, Port, username=None, password=None, token=None):
+    """Which identity is this credential? (LDAP user vs robot) -- synthese 3."""
+    r = api_get(registry_url, Port, "/api/v1/user", username, password, token)
+    if not describe_response(r, "/api/v1/user"):
+        return None
+    u = r.json()
+    print("### identity (/api/v1/user)")
+    for k in ("username", "email", "verified", "robot", "organizations",
+              "organizations_count", "avatar", "superuser"):
+        if k in u:
+            print("  %-20s = %s" % (k, json.dumps(u[k])[:140]))
+    return u
+
+
+def cmd_mirror_get(registry_url, Port, imageName, username=None, password=None, token=None):
+    """
+    GET /api/v1/repository/<org>/<repo>/mirror
+    The ONLY place Quay hands you the decrypted upstream login + the real
+    sync_status (as STRINGS, not the SQL integers), robot_username,
+    external_reference and next_start_date.  (synthese 5.1 + 9.1)
+    """
+    apipath = "/api/v1/repository/" + quote(imageName.strip("/"), safe='/') + "/mirror"
+    r = api_get(registry_url, Port, apipath, username, password, token)
+    if not describe_response(r, imageName + " mirror config"):
+        return None
+    m = r.json()
+    interesting = ("is_enabled", "sync_status", "sync_retries_remaining",
+                   "sync_interval", "next_start_date", "external_reference",
+                   "external_registry_username", "external_registry_config",
+                   "robot_username", "mirror_type",
+                   "skopeo_timeout_interval", "skopeo_timeout",
+                   "creation_date", "last_update_date", "sync_start_date",
+                   "sync_expiration_date")
+    print("### mirror config: %s" % imageName)
+    for k in interesting:
+        if k in m:
+            v = m[k]
+            # THE mask: upstream login is a credential (Quay decrypts it here
+            # for us). Never print it unless --show-secrets.
+            if (k == "external_registry_username" and not SHOW_SECRETS
+                    and v not in (None, "")):
+                v = "[MASKED login, %d chars -- --show-secrets to reveal]" % len(v)
+            if k == "external_registry_config" and isinstance(v, str):
+                try:
+                    v = json.loads(v)
+                except ValueError:
+                    pass
+            print("  %-30s = %s" % (k, json.dumps(v) if not isinstance(v, str) else v))
+    extra = [k for k in m if k not in interesting]
+    if extra:
+        print("  (other keys: %s)" % ", ".join(sorted(extra)))
+    if SHOW_SECRETS is False:
+        print("  [upstream login masked; --show-secrets to reveal -- it is the LDAP service account]")
+    return m
+
+
+def cmd_mirror_scan(registry_url, Port, org, username=None, password=None,
+                    token=None, only_problems=False, max_repos=0, offset=0):
+    """
+    Per-repo mirror inventory for an org, plus the two aggregate views that the
+    synthese asks SQL for (5.9 n1 = perimeter/host, n2 = health) but obtained
+    through the API. Repos without a mirror return 404 and are counted separately.
+    """
+    repos, pages, truncated = quay_list_org_repos(
+        registry_url, Port, org, username, password, token)
+    total_found = len(repos)
+    if offset:
+        repos = repos[offset:]
+    if max_repos:
+        repos = repos[:max_repos]
+    print("# org=%s  scanned=%d/%d (offset=%d)  pages=%d%s"
+          % (org, len(repos), total_found, offset, pages,
+             "  (ENUM TRUNCATED)" if truncated else ""))
+    print("%-46s %-10s %-9s %-6s %-3s  %s"
+          % ("REPOSITORY", "SYNC", "RETRIES", "ENABLE", "TM", "EXTERNAL_REFERENCE / ROBOT"))
+    hosts, health, robots, nomirror, err = {}, {}, {}, [], 0
+    for full in sorted(repos):
+        apipath = "/api/v1/repository/" + quote(full, safe='/') + "/mirror"
+        r = api_get(registry_url, Port, apipath, username, password, token)
+        if r.status_code == 404:
+            nomirror.append(full)
+            continue
+        if r.status_code != 200:
+            err += 1
+            continue
+        try:
+            m = r.json()
+        except ValueError:
+            err += 1
+            continue
+        st = str(m.get("sync_status"))
+        ref = m.get("external_reference") or ""
+        host = ref.split("/")[0] if ref else "-"
+        hosts[host] = hosts.get(host, 0) + 1
+        health[st] = health.get(st, 0) + 1
+        rb = m.get("robot_username") or "-"
+        robots[rb] = robots.get(rb, 0) + 1
+        bad = st not in ("SUCCESS",)
+        if only_problems and not bad:
+            continue
+        print("%-46s %-10s %-9s %-6s %-3s  %s"
+              % (full[:46], st, m.get("sync_retries_remaining"),
+                 m.get("is_enabled"), m.get("mirror_type"), (ref or "-")[:60]))
+        print("%-46s   robot=%s  next_sync(sync_start)=%s  lease=%s  skopeo_timeout=%s"
+              % ("", rb, m.get("sync_start_date"), m.get("sync_expiration_date"),
+                 m.get("skopeo_timeout_interval", m.get("skopeo_timeout"))))
+    print()
+    print("# HEALTH  " + "  ".join("%s=%d" % (k, v) for k, v in
+                                   sorted(health.items(), key=lambda x: -x[1]))
+          + "  | no-mirror=%d error=%d" % (len(nomirror), err))
+    print("# PERIMETRE (external_reference host)  "
+          + "  ".join("%s=%d" % (k, v) for k, v in
+                      sorted(hosts.items(), key=lambda x: -x[1])))
+    print("# ROBOTS  " + "  ".join("%s=%d" % (k, v) for k, v in
+                                   sorted(robots.items(), key=lambda x: -x[1])))
+    if nomirror:
+        print("# WITHOUT MIRROR (first 30): " + ", ".join(nomirror[:30]))
+        if len(nomirror) > 30:
+            print("   ... %d more" % (len(nomirror) - 30))
+    return
+
+
+def cmd_org_robots(registry_url, Port, org, username=None, password=None, token=None):
+    r = api_get(registry_url, Port,
+                "/api/v1/organization/" + quote(org, safe='') + "/robots",
+                username, password, token)
+    if not describe_response(r, "org %s robots" % org):
+        return None
+    d = r.json()
+    robots = d.get("robots", [])
+    print("### robots of org %s (%d)" % (org, len(robots)))
+    if robots:
+        print("    (entry keys: %s)" % ", ".join(sorted(robots[0].keys())))
+    for rb in robots:
+        print("  %-58s created=%-26s has_token=%s  description=%s"
+              % (rb.get("name"),
+                 rb.get("created") or rb.get("date_created") or "?",
+                 bool(rb.get("token")),
+                 (rb.get("description") or "")[:38]))
+    return True
+
+
+def cmd_repo_view(registry_url, Port, imageName, username=None, password=None, token=None):
+    """Repository view: gives `state` (NORMAL vs MIRROR -- synthese 2.2/8.14)."""
+    apipath = "/api/v1/repository/" + quote(imageName.strip("/"), safe='/')
+    r = api_get(registry_url, Port, apipath, username, password, token)
+    if not describe_response(r, "repo view " + imageName):
+        return None
+    d = r.json()
+    print("### repository: %s" % imageName)
+    for k in ("name", "namespace", "state", "is_public", "is_mirror", "permission",
+              "star_count", "repo_type", "size", "last_modified"):
+        if k in d:
+            v = d[k]
+            if k == "permission":
+                v = json.dumps(v)[:200]
+            print("  %-14s = %s" % (k, v))
+    if str(d.get("state")) == "MIRROR":
+        print("  -> state=MIRROR : pushes are REFUSED (oc-mirror must flip to NORMAL first, synthese 8.14)")
+    return d
+
+
+def lookup_credentials(registry_host, port="443"):
+    """
+    FIX (root cause of the 'silent empty / 401' behaviour):
+    the original code looked the registry up ONLY as "<host>:<port>", but
+    podman/docker store the key as the bare hostname (optionally with an
+    https:// scheme). So the lookup silently returned {} and every call fell
+    back to anonymous -> empty catalog / 401.
+    Try, in order: bare host, host:port, both with scheme, and suffix match.
+    NEVER prints or logs the secret. Returns a LIST of (dict, src) candidates.
+    """
+    found = []
+    candidates = []
+    for h in (registry_host,
+              registry_host + ":" + str(port),
+              registry_host.replace("https://", "").replace("http://", ""),
+              "https://" + registry_host,
+              "https://" + registry_host.replace("https://", "").replace("http://", "")):
+        if h and h not in candidates:
+            candidates.append(h)
+
+    # FIX: podman does NOT read ~/.docker/config.json first -- it uses its own
+    # store. The docker config can hold a DIFFERENT (older, or split-on-':')
+    # entry, which is what made the tool 401 while `podman search` succeeded.
+    # Order now mirrors podman's own precedence, and we collect EVERY match
+    # rather than returning the first, so the caller can try them all.
+    # podman's own precedence (verified on this host: the runtime dir store is
+    # the one `podman login` writes; ~/.config/containers/auth.json does NOT
+    # exist here and is only a documented fallback).
+    for path in (os.environ.get("REGISTRY_AUTH_FILE", ""),
+                 os.path.expandvars("$XDG_RUNTIME_DIR/containers/auth.json"),
+                 "~/.config/containers/auth.json",
+                 "~/.docker/config.json"):
+        if not path:
+            continue
+        path = os.path.expanduser(path)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                auths = json.load(f).get("auths", {})
+        except Exception:
+            continue
+        # unambiguous label: a path is not a secret, and 'containers/auth.json'
+        # used to hide WHICH file (XDG runtime vs ~/.config) was read.
+        ap = os.path.abspath(os.path.expanduser(path))
+        home = os.path.expanduser("~")
+        if ap.startswith(home + "/"):
+            src = "~/" + ap[len(home) + 1:]
+        elif ap.startswith("/run/user/"):
+            src = "$XDG_RUNTIME_DIR" + ap[len("/run/user"):]
+        else:
+            src = ap
+        # exact matches first, but COLLECT all (podman may hold a different,
+        # working entry than the docker config)
+        seen = set()
+        for c in candidates:
+            if c in auths:
+                d = _extract_pair(auths[c])
+                if d and d.get("raw") not in seen:
+                    seen.add(d.get("raw"))
+                    found.append((d, src))
+        # then: suffix match (handles a stored ":443" or scheme)
+        for stored, val in auths.items():
+            s = stored.replace("https://", "").replace("http://", "").rstrip("/")
+            for c in candidates:
+                cs = c.replace("https://", "").replace("http://", "").rstrip("/")
+                if s == cs or s == cs + ":443":
+                    d = _extract_pair(val)
+                    if d and d.get("raw") not in seen:
+                        seen.add(d.get("raw"))
+                        found.append((d, src))
+    return found
+
+
+def _extract_raw_b64(reg_data):
+    """
+    fork FIX (this is the real reason the tool failed while `podman search`
+    worked): a credential store entry may hold a value that is NOT a plain
+    'login:password' pair (OAuth identity token, credential-helper placeholder,
+    robot token...). Decoding it and splitting on ':' then INVENTS a login and a
+    password, and the registry rightly answers 401 'Invalid username or
+    password'. podman does not split: it replays the stored base64 verbatim as
+    the Basic header. Do exactly the same -- byte-identical to podman.
+    Returns the raw base64 string (never printed).
+    """
+    if not isinstance(reg_data, dict):
+        return None
+    raw = reg_data.get("auth")
+    if not raw:
+        return None
+    try:
+        base64.b64decode(raw, validate=True)
     except Exception:
-        pass
+        return None
+    # only usable as Basic if it decodes to something containing a ':'
+    try:
+        dec = base64.b64decode(raw).decode("utf-8", "replace")
+    except Exception:
+        return None
+    return raw if ":" in dec else None
 
-    return {}
-    
+
+def pair_shape(reg_data):
+    """
+    fork: report the SHAPE of the stored credential so the operator can tell a
+    robot token from an LDAP login WITHOUT ever seeing either. Prints lengths
+    and character classes only.
+    """
+    raw = reg_data.get("auth") if isinstance(reg_data, dict) else None
+    if not raw:
+        return "no 'auth' key (identitytoken only? -> /api/v1 needs -T token)"
+    try:
+        dec = base64.b64decode(raw).decode("utf-8", "replace")
+    except Exception:
+        return "undecodable 'auth'"
+    if ":" not in dec:
+        return "single token, no ':' (%d chars) -> NOT a login:password pair" % len(dec)
+    u, p = dec.split(":", 1)
+    def cls(s):
+        if s.isdigit():
+            return "all-digits"
+        if re.fullmatch(r"[0-9a-f]{8,}", s):
+            return "hex-like"
+        if re.fullmatch(r"[A-Za-z0-9._-]{16,}", s):
+            return "opaque-random"
+        return "human-readable"
+    return ("login=%d chars (%s), secret=%d chars (%s)"
+            % (len(u), cls(u), len(p), cls(p)))
+
+
+def _extract_pair(reg_data):
+    """
+    fork: return {'username','password','raw','shape'}. 'raw' is the stored
+    base64 to be replayed VERBATIM (podman-identical) and is the preferred
+    form; splitting is only a fallback for stores that keep explicit
+    username/password keys.
+    """
+    if not isinstance(reg_data, dict):
+        return None
+    out = {}
+    raw = _extract_raw_b64(reg_data)
+    if raw:
+        out["raw"] = raw
+        out["shape"] = pair_shape(reg_data)
+        try:
+            dec = base64.b64decode(raw).decode("utf-8", "replace")
+            if ":" in dec:
+                u, p = dec.split(":", 1)
+                out["username"], out["password"] = u, p
+        except Exception:
+            pass
+        return out
+    if "auth" in reg_data:
+        # auth present but not a usable login:password -> keep raw anyway
+        return {"raw": reg_data["auth"], "shape": pair_shape(reg_data)}
+    if "username" in reg_data and "password" in reg_data:
+        return {"username": reg_data["username"], "password": reg_data["password"],
+                "shape": "explicit username/password keys"}
+    return None
+
+
+def cmd_search_v1(registry_url, Port, term, username=None, password=None,
+                  token=None, pages_wanted=0, show_desc=False):
+    """
+    fork: the DEPRECATED registry V1 search API -- this is what
+    `podman search <registry>/` actually calls, and on this Quay it is the
+    ONLY working enumeration surface:
+        /v2/_catalog  -> {"repositories":[]}   (superuser-only in practice)
+        /v1/search    -> real results, but only WITH credentials (0 anonymous)
+    Paginates via num_pages. Read-only.
+    """
+    base = _base_url(registry_url, Port)
+    hdrs = {'Accept': 'application/json'}
+    # basic_header() falls back to RAW_BASIC, so a verbatim blob with no usable
+    # 'login:password' split still authenticates byte-identically to podman.
+    if username is not None or RAW_BASIC:
+        hdrs['Authorization'] = basic_header(username, password)
+    elif token:
+        hdrs['Authorization'] = "Bearer " + token
+
+    # v1 is served over plain http on 80 in the spec, but Quay serves it on 443.
+    r = requests.get(base + "/v1/search", headers=hdrs,
+                     params={"q": term or "", "n": 100}, timeout=30)
+    if r.status_code in (301, 302, 307, 308):
+        loc = r.headers.get("Location", "")
+        if loc:
+            r = requests.get(loc, headers=hdrs, timeout=30)
+    if not describe_response(r, "/v1/search?q=%r" % term):
+        return None
+    d = r.json()
+    results = d.get("results") or d.get("result") or []
+    npages = int(d.get("num_pages") or 1)
+    print("### /v1/search  q=%r  page=%s/%s  this page=%d results"
+          % (term or "*", d.get("page", 1), npages, len(results)))
+    if results:
+        print("    entry keys: %s" % sorted(results[0].keys()))
+    for it in results:
+        nm = it.get("name") or it.get("repo_name") or json.dumps(it)[:80]
+        line = "  " + nm
+        if show_desc:
+            line += "   " + (it.get("description") or "")[:60]
+        print(line)
+    # paginate
+    total = len(results)
+    page = int(d.get("page") or 1)
+    while page < npages and (pages_wanted == 0 or page < pages_wanted):
+        page += 1
+        rr = requests.get(base + "/v1/search", headers=hdrs,
+                          params={"q": term or "", "page": page, "n": 100}, timeout=30)
+        if rr.status_code != 200:
+            printstderr("** page %d -> HTTP %d, stopping" % (page, rr.status_code))
+            break
+        dd = rr.json()
+        rs = dd.get("results") or dd.get("result") or []
+        for it in rs:
+            print("  " + (it.get("name") or it.get("repo_name") or "?"))
+        total += len(rs)
+        if not rs:
+            break
+    print("# TOTAL collected: %d (%d pages)" % (total, page))
+    return results
+
+
+def v2_credential_accepted(registry_url, Port, auth_header, timeout=15):
+    """
+    fork: validate one candidate WITHOUT ever printing it.
+    FIX: must mirror getToken() EXACTLY (account= AND service=). Probing with
+    only service= yields a spurious 401, which made this gate reject perfectly
+    good credentials -- a self-inflicted regression that turned a working
+    list-catalog (962 repos) back into an anonymous empty answer.
+    """
+    try:
+        r = requests.get(_base_url(registry_url, Port) + "/v2/auth",
+                         headers={'Accept': 'application/json',
+                                  'Authorization': auth_header},
+                         params={"service": registry_url},
+                         timeout=timeout, allow_redirects=False)
+        return r.status_code == 200 and "token" in (r.text or "")
+    except Exception:
+        return False
+
+
+def v2_credential_accepted_account(registry_url, Port, auth_header, account, timeout=15):
+    """getToken()-identical probe: account=<login> + service=<host>."""
+    try:
+        r = requests.get(_base_url(registry_url, Port) + "/v2/auth",
+                         headers={'Accept': 'application/json',
+                                  'Authorization': auth_header},
+                         params={"account": account, "service": registry_url},
+                         timeout=timeout, allow_redirects=False)
+        return r.status_code == 200 and "token" in (r.text or "")
+    except Exception:
+        return False
+
+
+def auth_header_for(d):
+    """Build the Authorization value for one stored candidate (never printed)."""
+    if not isinstance(d, dict):
+        return None
+    if d.get("raw"):
+        return "Basic " + d["raw"]          # replayed VERBATIM, podman-identical
+    if d.get("username") is not None:
+        return basic_header(d.get("username"), d.get("password"))
+    return None
+
+
+API_HEADERS = None    # fork: header set for /api/v1, ONLY from explicit user input
+
+# ---------------------------------------------------------------------------
+# fork: the THIRD auth mode, the one the redhat-cop / infra.quay_configuration
+# collection actually uses, and the one this tool was missing.
+# Read it in module_utils/api_module.py ::
+#
+#     def authenticate(self):
+#         # Retrieve the CSRF cookie and token from /csrf_token (Quay 3.16+)
+#         GET  /csrf_token                      -> {"csrf_token": ...} + cookie
+#         POST /api/v1/signin  X-CSRF-Token: ...  {"username","password"}
+#                                              -> Set-Cookie: session=...
+#                                              -> X-Next-CSRF-Token: ...
+#         self.session.headers.update({"X-CSRF-Token": token})
+#
+# i.e. the modules log in through the WEB UI endpoint and then carry a SESSION
+# COOKIE. They NEVER send HTTP Basic to /api/v1 -- which is exactly why your
+# Ansible job can read robots/mirrors while this tool, Basic-only, gets 401
+# invalid_token.  /v2 (docker registry protocol) is the only place Basic works.
+#
+# NOTE ON 'READ-ONLY': POST /api/v1/signin mutates NO registry object. It opens
+# a session. Like any authenticated call it may touch user.last_accessed and it
+# does create an audit/login event server-side. It never creates, changes or
+# deletes an org, repo, robot or mirror.
+# ---------------------------------------------------------------------------
+SESSION = None      # requests.Session holding the Quay session cookie
+CSRF = None         # X-CSRF-Token value for the current session
+
+
+def web_login(registry_url, Port, username, password, timeout=25):
+    """
+    Establish a /api/v1 session exactly like APIModule.authenticate().
+    Returns True/False. NEVER prints, logs or returns any secret or cookie.
+    Credentials come from the caller (api_headers_for): either the operator
+    passed them explicitly (-u/-p or QRC_USERNAME/QRC_PASSWORD), or -- BY
+    DEFAULT -- the login:pass read from the credential store is replayed to
+    POST /api/v1/signin (set QRC_ALLOW_STORE_WEB_LOGIN=0 to forbid that).
+    WARNING: a failed /signin bumps invalid_login_attempts on that account,
+    which is often a shared service account that also carries every mirror
+    (--src-creds) -- a typo can lock mirroring platform-wide.
+    """
+    global SESSION, CSRF
+    if not username:
+        return False
+    base = _base_url(registry_url, Port)
+    s = requests.Session()
+    s.headers.update({'Accept': '*/*'})
+    csrf = None
+    # 1) CSRF from /csrf_token (Quay 3.16+), else window.__token from / (<=3.15)
+    try:
+        r = s.get(base + "/csrf_token", timeout=timeout)
+        if r.status_code == 200:
+            csrf = r.json().get("csrf_token")
+    except Exception:
+        csrf = None
+    if not csrf:
+        try:
+            r = s.get(base + "/", timeout=timeout)
+            m = re.search(r"window\.__token\s*=\s*'(.*?)';", r.text)
+            csrf = m.group(1) if m else None
+        except Exception:
+            csrf = None
+    if not csrf:
+        if debug:
+            printstderr("! web login: no CSRF token obtained from /csrf_token or /")
+        return False
+    # 2) the web sign-in
+    try:
+        r = s.post(base + "/api/v1/signin",
+                   headers={'Content-Type': 'application/json',
+                            'Accept': 'application/json',
+                            'X-CSRF-Token': csrf},
+                   data=json.dumps({"username": username, "password": password}),
+                   timeout=timeout, allow_redirects=False)
+    except Exception as e:
+        if debug:
+            printstderr("! web login: signin request failed (%s)" % type(e).__name__)
+        return False
+    if r.status_code != 200:
+        # report status + Quay's own error text only -- no credential involved
+        if debug:
+            printstderr("! web login: POST /api/v1/signin -> HTTP %d %s"
+                        % (r.status_code, (r.text or '')[:140].replace('\n', ' ')))
+        return False
+    h = {k.lower(): v for k, v in r.headers.items()}
+    CSRF = h.get("x-next-csrf-token", csrf)
+    SESSION = s
+    if debug:
+        printstderr("! web login: session established (cookie + CSRF held in memory only)")
+    return True
+
+
+class _NoAuthResult:
+    """
+    fork: placeholder returned by api_get() when no /api/v1 credential is
+    available. Looks like a requests.Response just enough for the callers
+    (status_code + describe_response) without ever hitting the network.
+    """
+    status_code = 0
+    url = "(not sent: no /api/v1 credential)"
+    text = ""
+    headers = {}
+
+
+def api_headers_for(token=None, username=None, password=None, registry=None, port=None):
+    """
+    fork: /api/v1 (mirror config, robots, repo view) does NOT accept Basic on
+    this Quay -- it answers 401 'invalid_token' even though the same blob is
+    accepted on /v2/auth.
+
+    Three supported modes, in order:
+      1. -T token / QRC_TOKEN                 -> 'Authorization: Bearer ...'
+         (the OAuth app token of the per-org 'ansible' application, synthese
+          4.5/9.1 -- this is what quay_api_token.py hands to the modules)
+      2. QRC_COOKIE='session=...'             -> browser session replay
+      3. WEB LOGIN (NEW, this is what the Ansible collection does):
+         -u/-p or QRC_USERNAME/QRC_PASSWORD  -> GET /csrf_token
+                                             -> POST /api/v1/signin
+                                             -> session cookie + X-CSRF-Token
+         See module_utils/api_module.py::APIModule.authenticate(). The modules
+         NEVER send HTTP Basic to /api/v1; they sign in to the web UI and carry
+         a session. That is the whole difference with this tool, which was
+         Basic-only.
+
+    SECURITY: never derives or replays the /v2 stored blob as an API
+    credential. Web login only happens with credentials the operator passes
+    explicitly for it.
+    """
+    global API_HEADERS, RAW_BASIC
+    if API_HEADERS is not None and not token and not os.environ.get("QRC_TOKEN") \
+       and not os.environ.get("QRC_COOKIE") and not username:
+        return API_HEADERS
+    tok = token or os.environ.get("QRC_TOKEN")
+    if tok:
+        h = {'Accept': 'application/json', 'Authorization': "Bearer " + tok}
+        API_HEADERS = h
+        return h
+    ck = os.environ.get("QRC_COOKIE")
+    if ck:
+        h = {'Accept': 'application/json', 'Cookie': ck}
+        API_HEADERS = h
+        return h
+    # mode 3: web sign-in, exactly like the Ansible collection
+    u = username or os.environ.get("QRC_USERNAME")
+    p = password or os.environ.get("QRC_PASSWORD", "")
+    if u and registry:
+        # Credentials the operator passes explicitly override any stored blob,
+        # otherwise basic_header()/web_login() would silently use the WRONG pair.
+        if not CREDS_FROM_STORE and RAW_BASIC:
+            # operator gave -u/-p explicitly on the command line: never let a
+            # previously loaded store blob override it in basic_header().
+            RAW_BASIC = None
+            if debug:
+                printstderr("- explicit -u/-p given; ignoring any stored blob")
+        # Credentials auto-loaded from a credential file are replayed to the
+        # WEB sign-in BY DEFAULT (ALLOW_STORE_WEB_LOGIN defaults to "1") --
+        # this is the operator's own login:pass. Set QRC_ALLOW_STORE_WEB_LOGIN=0
+        # to require explicit -u/-p or QRC_TOKEN instead. WARNING: a failed
+        # /signin bumps invalid_login_attempts on that account, which is often
+        # a shared service account that also carries every mirror
+        # (--src-creds) -- a typo can lock mirroring platform-wide.
+        # Credentials the operator passes explicitly for THIS run (-u/-p,
+        # QRC_USERNAME) are used directly, exactly like the Ansible modules do.
+        if CREDS_FROM_STORE and not ALLOW_STORE_WEB_LOGIN:
+            if debug:
+                printstderr("- web login skipped: credentials came from a credential "
+                            "file and QRC_ALLOW_STORE_WEB_LOGIN=0 forbids replaying "
+                            "them to POST /api/v1/signin; pass -u/-p explicitly or "
+                            "unset QRC_ALLOW_STORE_WEB_LOGIN to allow it")
+            return None
+        if SESSION is not None or web_login(registry, port or 443, u, p):
+            return {'Accept': 'application/json'}   # SESSION carries the cookie
+        return None
+    return None
+
+
+def explain_api_auth_needed(registry_url):
+    printstderr("** /api/v1 needs an OAuth/app token or a session cookie -- the stored")
+    printstderr("   registry credential is a /v2 (docker protocol) credential and this")
+    printstderr("   Quay refuses it on the API (401 invalid_token). I will not derive or")
+    printstderr("   replay it in another form. Provide one of:")
+    printstderr("     QRC_TOKEN=<token>   # the per-org 'ansible' OAuth token the Ansible")
+    printstderr("                         # role uses (synthese 4.5 / 9.1), or a robot token")
+    printstderr("     QRC_COOKIE='session=<...>'   # your browser session on this Quay")
+    printstderr("   Then re-run. Meanwhile /v2 works: list-catalog, list-tags, search-v1.")
+    return None
+
+
+def require_api_credential(token, username=None, password=None,
+                           registry_url=None, port=None):
+    """fork: bail out BEFORE any API call when no /api/v1 credential exists,
+    so callers never print a misleading '0 repositories'. Tries the three
+    modes (token / cookie / web login) exactly like api_get()."""
+    if api_headers_for(token, username, password, registry_url, port) is None:
+        explain_api_auth_needed(registry_url or "(registry)")
+        sys.exit(5)
+
+
+def cmd_org_exists(registry_url, Port, names):
+    """
+    fork: list the organizations WITHOUT any credential.
+    Discovered by probe: on this Quay (ANONYMOUS_ACCESS=True) the public
+    GET /api/v1/organization/<name> acts as an ORACLE:
+        200 = org exists    404 = does not exist
+    There is NO anonymous enumeration endpoint (no GET list-all-organizations
+    exists in the swagger), so you probe a CANDIDATE list. Cheap, read-only,
+    and enough to verify mirror_orgs / rom_quay_orgs / workflow divergence
+    (synthese 8.10) against reality.
+    The full authoritative list is GET /api/v1/superuser/users/ (needs a
+    SUPERUSER token; orgs appear there because they are rows of "user" --
+    synthese 5.3) -- reachable with: quay-api-listuser -T <supertoken>.
+    """
+    base = _base_url(registry_url, Port)
+    print("### org oracle (anonymous GET /api/v1/organization/<name>)")
+    print("  200 = EXISTS   404 = absent   401 = exists-but-private-something")
+    yes, no, other = [], [], []
+    for n in names:
+        n = n.strip()
+        if not n:
+            continue
+        r = requests.get(base + "/api/v1/organization/" + quote(n, safe=''),
+                         timeout=20, allow_redirects=True)
+        code = r.status_code
+        if code == 200:
+            try:
+                nm = r.json().get("name")
+            except ValueError:
+                nm = n
+            print("  EXISTS  %-20s (name=%r)" % (n, nm))
+            yes.append(n)
+        elif code == 404:
+            print("  absent  %-20s" % n)
+            no.append(n)
+        else:
+            print("  ????    %-20s HTTP %d" % (n, code))
+            other.append(n)
+    print("\n# existing: %s" % (", ".join(yes) or "-"))
+    print("# absent  : %s" % (", ".join(no) or "-"))
+    if other:
+        print("# weird   : %s" % ", ".join(other))
+    print("\n# To get the AUTHORITATIVE full list (incl. empty orgs and robots):")
+    print("#   ./qrc.py quay-api-listuser -r %s -T <SUPERUSER token>" % registry_url)
+    print("#   (orgs and robots are rows of \"user\", synthese 5.3; filter organization=true)")
+    return yes, no
+
+
 def display_help():
     print("Usage: %s     " % (sys.argv[0] ))
     print(f"Version: {VERSION}")
@@ -745,6 +1608,40 @@ def display_help():
     print("  delete-tag                      : delete one tag <-i imagename> <-t tag> required")
     print("  delete-all-repo                 : delete all repositories (requires --i-am-deleting-all-repo)")
     print("  set-api-key-value               : set one key=value on an API path <-a apipath> <-K key> <-V value> required")
+    print("")
+    print("  ## READ-ONLY QUAY MIRRORING API (this fork; no credentials are printed)      ##")
+    print("  quay-config                     : effective runtime config from public /config (no auth) [-r]")
+    print("  whoami                          : which identity is this credential (LDAP vs robot) [-r -u/-p or -T]")
+    print("  list-org-repos                  : list repos of an org <-o org> (Quay way: /v2/_catalog is EMPTY)")
+    print("  org-robots                      : list the robots of an org <-o org> (mirroring robots)")
+    print("  repo-view                       : repo view: gives state NORMAL/MIRROR <-i org/repo>")
+    print("  mirror-get                      : mirror config of ONE repo <-i org/repo> (sync_status, external_reference, robot)")
+    print("  mirror-scan                     : per-repo mirror inventory of an org <-o org>")
+    print("                                    + HEALTH / PERIMETRE / ROBOTS aggregates  [--only-problems] [--max-repos N]")
+    print("  org-exists                      : ORACLE (anonymous) <-o? no, --orgs a,b,c>")
+    print("                                    200=exists / 404=absent; no org list is hardcoded")
+    print("  search-v1                       : registry V1 search (what `podman search` calls)")
+    print("")
+    print("  /api/v1 auth modes (Basic is REFUSED by the Quay frontend, 401 invalid_token):")
+    print("    1. -T token / QRC_TOKEN=...    OAuth app token (the per-org 'ansible' app,")
+    print("                                   what quay_api_token.py hands the modules)")
+    print("    2. QRC_COOKIE='session=...'    replay a browser session cookie")
+    print("    3. -u/-p or QRC_USERNAME/QRC_PASSWORD")
+    print("                                   WEB LOGIN: GET /csrf_token then")
+    print("                                   POST /api/v1/signin -> session cookie.")
+    print("                                   This is exactly what the infra.quay_configuration")
+    print("                                   collection does (api_module.py::authenticate),")
+    print("                                   and the reason your Ansible job works here.")
+    print("                                   Credentials read from the credential store are")
+    print("                                   replayed to POST /api/v1/signin BY DEFAULT.")
+    print("                                   Set QRC_ALLOW_STORE_WEB_LOGIN=0 to forbid it.")
+    print("                                   WARNING: a failed /signin bumps")
+    print("                                   invalid_login_attempts on that account -- often")
+    print("                                   the shared service account carrying every")
+    print("                                   mirror (--src-creds); a typo can lock mirroring")
+    print("                                   platform-wide.")
+    print("")
+    print("  ## READ-ONLY MODE: delete-*/set-api-key-value/create-user/delete-user/change-userpassword are DISABLED ##")
     print("Options            ")
     print("  <-r registry_url>")
     print("  <-u username>    ")
@@ -776,7 +1673,7 @@ _quayregistryclient() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     cmd="${COMP_WORDS[1]}"
 
-    local commands="list-catalog list-tags list-all get-image-digest get-image-manifest get-blob delete-repo delete-tag delete-all-repo browse-api quay-api-discovery quay-api-listuser quay-api-delete-user quay-api-create-user quay-api-change-userpassword set-api-key-value get-server-certificate"
+    local commands="list-catalog list-tags list-all get-image-digest get-image-manifest get-blob delete-repo delete-tag delete-all-repo browse-api quay-api-discovery quay-api-listuser quay-api-delete-user quay-api-create-user quay-api-change-userpassword set-api-key-value get-server-certificate quay-config whoami list-org-repos org-robots repo-view mirror-get mirror-scan search-v1 org-exists interactive"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "${commands}" -- ${cur}) )
@@ -913,19 +1810,23 @@ _complete_repositories() {
         return 1
     fi
 
-    repos=$(python3 -c "
-import requests, json, sys
+    # SECURITY: the token is passed through the ENVIRONMENT, not the python3
+    # command line (a command line is world-readable in `ps`).
+    repos=$(QRC_COMPL_TOKEN="${token}" QRC_COMPL_REGISTRY="${registry}" \
+            QRC_COMPL_PORT="${port}" python3 -c '
+import os, requests, json, sys
 try:
-    headers = {'Authorization': 'Bearer ${token}'}
-    response = requests.get('https://${registry}:${port}/v2/_catalog', headers=headers, timeout=5)
+    headers = {"Authorization": "Bearer " + os.environ["QRC_COMPL_TOKEN"]}
+    url = "https://%s:%s/v2/_catalog" % (os.environ["QRC_COMPL_REGISTRY"], os.environ["QRC_COMPL_PORT"])
+    response = requests.get(url, headers=headers, timeout=5)
     if response.status_code == 200:
         data = json.loads(response.text)
-        print(' '.join(data.get('repositories', [])))
+        print(" ".join(data.get("repositories", [])))
     else:
         sys.exit(1)
-except Exception as e:
+except Exception:
     sys.exit(1)
-" 2>&1)
+' 2>&1)
 
     if [[ $? -eq 0 && -n "${repos}" ]]; then
         COMPREPLY=( $(compgen -W "${repos}" -- "${cur}") )
@@ -954,19 +1855,25 @@ _complete_tags() {
         return 1
     fi
 
-    tags=$(python3 -c "
-import requests, json, sys
+    # SECURITY: token + image via the environment, never the command line
+    # (also immune to a repo name containing quotes).
+    tags=$(QRC_COMPL_TOKEN="${token}" QRC_COMPL_REGISTRY="${registry}" \
+            QRC_COMPL_PORT="${port}" QRC_COMPL_IMAGE="${image}" python3 -c '
+import os, requests, json, sys
 try:
-    headers = {'Authorization': 'Bearer ${token}'}
-    response = requests.get('https://${registry}:${port}/v2/${image}/tags/list', headers=headers, timeout=5)
+    headers = {"Authorization": "Bearer " + os.environ["QRC_COMPL_TOKEN"]}
+    url = "https://%s:%s/v2/%s/tags/list" % (os.environ["QRC_COMPL_REGISTRY"],
+                                             os.environ["QRC_COMPL_PORT"],
+                                             os.environ["QRC_COMPL_IMAGE"])
+    response = requests.get(url, headers=headers, timeout=5)
     if response.status_code == 200:
         data = json.loads(response.text)
-        print(' '.join(data.get('tags', [])))
+        print(" ".join(data.get("tags", [])))
     else:
         sys.exit(1)
-except Exception as e:
+except Exception:
     sys.exit(1)
-" 2>&1)
+' 2>&1)
 
     if [[ $? -eq 0 && -n "${tags}" ]]; then
         COMPREPLY=( $(compgen -W "${tags}" -- "${cur}") )
@@ -986,27 +1893,31 @@ _get_token() {
     if [[ -z "${username}" || -z "${password}" ]]; then
         if [[ -f "${config_file}" ]]; then
             local creds
-            creds=$(python3 -c "
-import json, base64, sys
+            # SECURITY: path + registry via the environment, not the command line.
+            creds=$(QRC_COMPL_CONFIG="${config_file}" QRC_COMPL_REGISTRY="${registry}" \
+                    QRC_COMPL_PORT="${port}" python3 -c '
+import os, json, base64, sys
 try:
-    with open('${config_file}', 'r') as f:
+    with open(os.environ["QRC_COMPL_CONFIG"], "r") as f:
         config = json.load(f)
-    auths = config.get('auths', {})
-    for key in ['${registry}:${port}', '${registry}', 'https://${registry}', 'http://${registry}']:
+    auths = config.get("auths", {})
+    registry = os.environ["QRC_COMPL_REGISTRY"]
+    port = os.environ["QRC_COMPL_PORT"]
+    for key in [registry + ":" + port, registry, "https://" + registry, "http://" + registry]:
         if key in auths:
             auth_data = auths[key]
-            if 'auth' in auth_data:
-                decoded = base64.b64decode(auth_data['auth']).decode('utf-8')
-                if ':' in decoded:
+            if "auth" in auth_data:
+                decoded = base64.b64decode(auth_data["auth"]).decode("utf-8")
+                if ":" in decoded:
                     print(decoded)
                     sys.exit(0)
-            if 'username' in auth_data and 'password' in auth_data:
-                print(auth_data['username'] + ':' + auth_data['password'])
+            if "username" in auth_data and "password" in auth_data:
+                print(auth_data["username"] + ":" + auth_data["password"])
                 sys.exit(0)
 except Exception:
     pass
 sys.exit(1)
-" 2>/dev/null)
+' 2>/dev/null)
             if [[ $? -eq 0 && -n "${creds}" ]]; then
                 username="${creds%%:*}"
                 password="${creds#*:}"
@@ -1015,21 +1926,29 @@ sys.exit(1)
     fi
 
     if [[ -n "${username}" && -n "${password}" ]]; then
-        python3 -c "
-import requests, json, sys, base64
+        # SECURITY: credentials via the environment, never the command line.
+        # service= WITHOUT the port, matching getToken() (Quay advertises the
+        # service without it); Basic encoded in UTF-8 like podman.
+        QRC_COMPL_USER="${username}" QRC_COMPL_PASS="${password}" \
+            QRC_COMPL_REGISTRY="${registry}" QRC_COMPL_PORT="${port}" python3 -c '
+import os, requests, json, sys, base64
+from urllib.parse import urlencode
 try:
-    auth = ('${username}', '${password}')
-    headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
-    options = {'account': '${username}', 'service': '${registry}:${port}'}
-    from urllib.parse import urlencode
-    url = 'https://${registry}:${port}/v2/auth?' + urlencode(options)
-    response = requests.get(url, auth=auth, headers=headers)
+    user = os.environ["QRC_COMPL_USER"]
+    registry = os.environ["QRC_COMPL_REGISTRY"]
+    port = os.environ["QRC_COMPL_PORT"]
+    raw = ("%s:%s" % (user, os.environ["QRC_COMPL_PASS"])).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "Authorization": "Basic " + base64.b64encode(raw).decode("ascii")}
+    options = {"account": user, "service": registry}
+    url = "https://%s:%s/v2/auth?" % (registry, port) + urlencode(options)
+    response = requests.get(url, headers=headers)
     if response.status_code == 200:
         data = json.loads(response.text)
-        print(data.get('token', ''))
+        print(data.get("token", ""))
 except Exception:
     sys.exit(1)
-" 2>/dev/null
+' 2>/dev/null
     fi
 }
 
@@ -1086,7 +2005,7 @@ def create_parser():
 
     sp_digest = subparsers.add_parser('get-image-digest', help='Get the digest of an image', add_help=False)
     sp_digest.add_argument('-r', '--registry-url', required=True)
-    sp_digest.add_argument('-P', '--port', required=True)
+    sp_digest.add_argument('-P', '--port', default='443')
     sp_digest.add_argument('-u', '--username')
     sp_digest.add_argument('-p', '--password')
     sp_digest.add_argument('-i', '--image-name', required=True)
@@ -1141,18 +2060,24 @@ def create_parser():
     sp_browse.add_argument('-T', '--token', required=True)
     sp_browse.add_argument('-a', '--apipath', required=True)
     sp_browse.add_argument('-d', '--debug', action='store_true')
+    sp_browse.add_argument('--show-secrets', action='store_true',
+                           help='do not redact secrets in the API response')
 
     sp_discovery = subparsers.add_parser('quay-api-discovery', help='Query Quay API discovery endpoint', add_help=False)
     sp_discovery.add_argument('-r', '--registry-url', required=True)
     sp_discovery.add_argument('-P', '--port', default='443')
     sp_discovery.add_argument('-T', '--token', required=True)
     sp_discovery.add_argument('-d', '--debug', action='store_true')
+    sp_discovery.add_argument('--show-secrets', action='store_true',
+                              help='do not redact secrets in the API response')
 
     sp_listuser = subparsers.add_parser('quay-api-listuser', help='List Quay users via superuser API', add_help=False)
     sp_listuser.add_argument('-r', '--registry-url', required=True)
     sp_listuser.add_argument('-P', '--port', default='443')
     sp_listuser.add_argument('-T', '--token', required=True)
     sp_listuser.add_argument('-d', '--debug', action='store_true')
+    sp_listuser.add_argument('--show-secrets', action='store_true',
+                             help='do not redact secrets in the API response')
 
     sp_deluser = subparsers.add_parser('quay-api-delete-user', help='Delete a Quay user via superuser API', add_help=False)
     sp_deluser.add_argument('-r', '--registry-url', required=True)
@@ -1189,6 +2114,46 @@ def create_parser():
     sp_cert.add_argument('-r', '--registry-url', required=True)
     sp_cert.add_argument('-P', '--port', default='443')
     sp_cert.add_argument('-d', '--debug', action='store_true')
+
+    # ---- fork: Quay mirroring API (read-only) ----
+    for name, hlp in [
+        ('quay-config', 'effective runtime config from public /config (no credential)'),
+        ('whoami', 'which identity is this credential (LDAP user vs robot)'),
+        ('list-org-repos', 'list repositories of an org (Quay way; /v2/_catalog is empty)'),
+        ('org-robots', 'list the robots of an org (mirroring robots, synthese 4.4)'),
+        ('repo-view', 'repository view: gives state NORMAL/MIRROR (synthese 2.2)'),
+        ('mirror-get', 'mirror config of ONE repo: sync_status, external_reference, robot (synthese 9.1)'),
+        ('mirror-scan', 'per-repo mirror inventory of an org + HEALTH/PERIMETRE/ROBOTS aggregates (synthese 5.9)'),
+        ('search-v1', 'registry V1 search (what `podman search` calls) - the working enumeration here'),
+        ('org-exists', 'ORACLE (anonymous): probe candidate org names, 200=exists / 404=absent'),
+    ]:
+        sp = subparsers.add_parser(name, help=hlp, add_help=False)
+        sp.add_argument('-r', '--registry-url', required=True)
+        sp.add_argument('-P', '--port', default='443')
+        sp.add_argument('-u', '--username')
+        sp.add_argument('-p', '--password')
+        sp.add_argument('-T', '--token')
+        sp.add_argument('-d', '--debug', action='store_true')
+        sp.add_argument('--show-secrets', action='store_true',
+                        help='reveal the upstream login (default: masked)')
+        if name in ('list-org-repos', 'org-robots', 'mirror-scan'):
+            sp.add_argument('-o', '--org', required=True, help='organization, e.g. myorg')
+        if name in ('repo-view', 'mirror-get'):
+            sp.add_argument('-i', '--image-name', required=True, help='org/repo, e.g. myorg/myrepo')
+        if name == 'mirror-scan':
+            sp.add_argument('--only-problems', action='store_true',
+                            help='print only repos whose sync_status != SUCCESS')
+            sp.add_argument('--max-repos', type=int, default=0,
+                            help='limit the number of repos inspected (0 = all)')
+            sp.add_argument('--offset', type=int, default=0,
+                            help='skip the first N repos (chunk long scans, e.g. ocp4)')
+        if name == 'search-v1':
+            sp.add_argument('-q', '--query', default='', help='search term (empty = all)')
+            sp.add_argument('--pages', type=int, default=0, help='max pages (0 = all)')
+            sp.add_argument('--desc', action='store_true', help='show descriptions')
+        if name == 'org-exists':
+            sp.add_argument('--orgs', default='',
+                            help='comma-separated candidate org names (required; no default)')
 
     sp_interactive = subparsers.add_parser('interactive', help='Launch interactive ncurses interface', add_help=False)
     sp_interactive.add_argument('-r', '--registry-url', required=True)
@@ -1830,6 +2795,22 @@ def main():
     global debug
     debug = 1 if args.debug else None
 
+    # fork: opt-in secret reveal (default OFF -> upstream LDAP login is masked)
+    global SHOW_SECRETS
+    if getattr(args, 'show_secrets', False):
+        SHOW_SECRETS = True
+
+    org = getattr(args, 'org', None)
+    only_problems = getattr(args, 'only_problems', False)
+    max_repos = getattr(args, 'max_repos', 0)
+    cmd_early = args.command
+
+    # fork: read-only hard lock (never mutate the registry)
+    if READ_ONLY and cmd_early in DESTRUCTIVE_COMMANDS:
+        printstderr("** READ-ONLY mode: '%s' is disabled in this fork." % cmd_early)
+        printstderr("   Set READ_ONLY = False in the source if you really mean to mutate.")
+        sys.exit(4)
+
     registry_url = args.registry_url
     Port = args.port
     username = args.username
@@ -1864,27 +2845,70 @@ def main():
             registry_url = registry_url.replace(match.group(0), "")
     
 
-    # Find the credentials in the ~/.docker/config.json file
-    if registry_url != None and username==None and password==None:
-        mydict={}
-        clean_url = registry_url
-        pattern = r'(/)$'
-        match = re.search(pattern, clean_url)
-        if match:
-          clean_url = clean_url.replace(match.group(0), "")
-        
-        if registry_url!=None and Port!=None:
-            mydict=get_registry_password("~/.docker/config.json",clean_url+":"+str(Port))
-        elif registry_url:
-            mydict=get_registry_password("~/.docker/config.json",clean_url)
-        if (mydict and mydict["username"] and mydict["password"]):
-            username=mydict["username"]
-            password=mydict["password"]
+    # Find the credentials in ~/.docker/config.json (or podman's auth.json).
+    # FIX: was matching only "<host>:443" -> silently no creds -> 401 / empty.
+    global RAW_BASIC, CREDS_FROM_STORE
+    if registry_url is not None and username is None and password is None and token is None:
+        # FIX: strip a trailing '/' so the key matches the stored bare hostname
+        # (`podman search host/` works, the old "<host>/" lookup never did).
+        clean_url = registry_url.strip().rstrip("/")
+        cands = lookup_credentials(clean_url, Port)
+        chosen = None
+        for d, src in cands:
+            ah = auth_header_for(d)
+            if not ah:
+                continue
+            # probe EXACTLY like getToken() does (account+service), else we
+            # reject valid credentials and fall back to an empty anonymous read
+            ok = False
+            if d.get("username") is not None:
+                ok = v2_credential_accepted_account(registry_url, Port, ah,
+                                                    d["username"])
+            if not ok and d.get("raw"):
+                ok = v2_credential_accepted(registry_url, Port, ah)
+            if ok:
+                chosen = (d, src)
+                break
+            if debug:
+                printstderr("# candidate from %s not accepted by the account+service "
+                            "probe (shape: %s)" % (src, d.get("shape", "?")))
+        if chosen:
+            d, src = chosen
+            if d.get("raw"):
+                RAW_BASIC = d["raw"]        # replayed VERBATIM, podman-identical
+            username, password = d.get("username"), d.get("password")
+            CREDS_FROM_STORE = True
+            if debug:
+                printstderr("# credential ACCEPTED from %s (shape: %s)"
+                            % (src, d.get("shape", "login:password")))
+        elif cands:
+            # FIX: do NOT declare the credential dead. Two stores hold DIFFERENT
+            # secrets for the same login here; podman's own search works, so the
+            # probe (not the credential) may be the problem. Replay the first
+            # candidate in podman's precedence order and let the real call speak.
+            d, src = cands[0]
+            if d.get("raw"):
+                RAW_BASIC = d["raw"]
+            username, password = d.get("username"), d.get("password")
+            CREDS_FROM_STORE = True
+            printstderr("** probe rejected %d candidate(s); replaying the first from %s"
+                        " (podman precedence, values not shown)" % (len(cands), src))
+            printstderr("   if the call below then 401s, re-authenticate with:"
+                        "  podman login %s" % clean_url)
+        elif debug:
+            printstderr("# no credential found for %r; trying anonymous" % clean_url)
 
     if tag==None:
         tag="latest"
 
     cmd = args.command
+
+    # fork: every /api/v1 command needs a real API credential (QRC_TOKEN or
+    # -T token) -- the stored /v2 credential is refused by the Quay frontend.
+    # Fail once, up front, instead of printing misleading empty results.
+    if cmd in ("whoami", "list-org-repos", "org-robots", "repo-view",
+               "mirror-get", "mirror-scan"):
+        require_api_credential(token, username, password, registry_url, Port)
 
     if cmd == "get-server-certificate":
         if not all([registry_url,Port]):
@@ -1962,24 +2986,22 @@ def main():
             print(f"Error: missing parameters get-blob(registry_url={registry_url},username={username},password={password_val},Port={Port},imageName={imageName},digest={digest})")
             sys.exit(2)
         getblob(registry_url, username, password,Port,imageName,digest)
-    elif cmd == "list-digest":
-        if not all([registry_url, username, password,Port,imageName,token]):
-            print("Error: missing parameters list-digest(registry_url={registry_url},username={username},password={password},Port={Port},imageName={imageName},token={token})")
-            sys.exit(2)
-        listdigest(registry_url, username, password,Port,imageName,token)
     elif cmd == "delete-repo":
-        if not all([registry_url,imageName,token]):
-            print(f"Error: missing parameters delete-repo(registry_url={registry_url},imageName={imageName},token={token})")
+        if not all([registry_url, Port, imageName, token]):
+            token_val="##maskingToken##" if token is not None else token
+            print(f"Error: missing parameters delete-repo(registry_url={registry_url},Port={Port},imageName={imageName},token={token_val})")
             sys.exit(2)
         deleterepo(registry_url, Port,imageName,token)
     elif cmd == "delete-tag":
         if not all([registry_url, Port,imageName,token,tag]):
-            print(f"Error: missing parameters delete-tag(registry_url={registry_url},Port={Port},imageName={imageName},token={token},tag={tag})")
+            token_val="##maskingToken##" if token is not None else token
+            print(f"Error: missing parameters delete-tag(registry_url={registry_url},Port={Port},imageName={imageName},token={token_val},tag={tag})")
             sys.exit(2)
         deletetag(registry_url, Port,imageName,token,tag)
     elif cmd == "set-api-key-value":
         if not all([registry_url, Port,token,apipath,key,value]):
-            print(f"Error: missing parameters set-api-key-value(registry_url={registry_url},Port={Port},token={token},apipath={apipath},key={key},value={value})")
+            token_val="##maskingToken##" if token is not None else token
+            print(f"Error: missing parameters set-api-key-value(registry_url={registry_url},Port={Port},token={token_val},apipath={apipath},key={key},value={value})")
             sys.exit(2)
         setapikeyvalue(registry_url, Port,token,apipath,key,value)
     elif cmd == "delete-all-repo":
@@ -1989,10 +3011,67 @@ def main():
             print("To proceed, you must strictly add the flag: --i-am-deleting-all-repo")
             sys.exit(1)
         if not all([registry_url, username, password,Port,token]):
-            password_val="##maskingPassword##" if password is not None else password
-            print(f"Error: missing parameters delete-all-repo(registry_url={registry_url},Port={Port},token={token}")
+            token_val="##maskingToken##" if token is not None else token
+            print(f"Error: missing parameters delete-all-repo(registry_url={registry_url},Port={Port},token={token_val})")
             sys.exit(2)
         deleteallrepo(registry_url, username, password,Port,token)
+    # ================= fork: read-only Quay mirroring API commands =================
+    elif cmd == "quay-config":
+        get_config(registry_url, Port)
+    elif cmd == "whoami":
+        if whoami(registry_url, Port, username, password, token) is None:
+            sys.exit(1)
+    elif cmd == "list-org-repos":
+        if not all([registry_url, Port, org]):
+            print("Error: list-org-repos needs -r and -o <org>"); sys.exit(2)
+        repos, pages, trunc = quay_list_org_repos(registry_url, Port, org,
+                                                  username, password, token)
+        for x in sorted(repos):
+            print(x)
+        printstderr("# %d repositories in %d pages%s"
+                    % (len(repos), pages, " (TRUNCATED)" if trunc else ""))
+        if not repos and not (username or token):
+            printstderr("** EMPTY, but you are ANONYMOUS. On this Quay all repos are private,")
+            printstderr("   so 'anonymous + empty' looks exactly like 'org is empty'.")
+            printstderr("   Authenticate (credentials in ~/.docker/config.json, or -u/-p/-T) before concluding.")
+    elif cmd == "org-robots":
+        if not all([registry_url, Port, org]):
+            print("Error: org-robots needs -r and -o <org>"); sys.exit(2)
+        if cmd_org_robots(registry_url, Port, org, username, password, token) is None:
+            sys.exit(1)
+    elif cmd == "repo-view":
+        if not all([registry_url, Port, imageName]):
+            print("Error: repo-view needs -r and -i <org/repo>"); sys.exit(2)
+        if cmd_repo_view(registry_url, Port, imageName, username, password, token) is None:
+            sys.exit(1)
+    elif cmd == "mirror-get":
+        if not all([registry_url, Port, imageName]):
+            print("Error: mirror-get needs -r and -i <org/repo>"); sys.exit(2)
+        if cmd_mirror_get(registry_url, Port, imageName, username, password, token) is None:
+            sys.exit(1)
+    elif cmd == "mirror-scan":
+        if not all([registry_url, Port, org]):
+            print("Error: mirror-scan needs -r and -o <org>"); sys.exit(2)
+        cmd_mirror_scan(registry_url, Port, org, username, password, token,
+                        only_problems=only_problems, max_repos=max_repos,
+                        offset=getattr(args, 'offset', 0))
+    elif cmd == "org-exists":
+        if not all([registry_url, Port]):
+            print("Error: org-exists needs -r"); sys.exit(2)
+        raw = getattr(args, 'orgs', '') or ""
+        if not raw:
+            printstderr("** --orgs is REQUIRED. No org list is hardcoded here: a generic")
+            printstderr("   registry client must not embed one customer's inventory.")
+            printstderr("   e.g.  --orgs orgA,orgB,orgC   (probed one by one: 200=exists/404=absent)")
+            sys.exit(2)
+        cmd_org_exists(registry_url, Port, [x for x in raw.split(",") if x.strip()])
+    elif cmd == "search-v1":
+        if not all([registry_url, Port]):
+            print("Error: search-v1 needs -r"); sys.exit(2)
+        cmd_search_v1(registry_url, Port, getattr(args, 'query', '') or imageName,
+                      username, password, token,
+                      pages_wanted=getattr(args, 'pages', 0),
+                      show_desc=getattr(args, 'desc', False))
     elif cmd == "interactive":
         from curses import wrapper
         loop = QueryLoop(registry_url, Port, username, password, debug)
@@ -2009,185 +3088,3 @@ def main():
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     main()
-    def __init__(self, registry_url, port, username, password, debug=False):
-        self.registry_url = registry_url
-        self.port = port
-        self.username = username
-        self.password = password
-        self.debug = debug
-        self.token = None
-        self.repositories = []
-        self.current_view = "main"
-        self.selected_idx = 0
-
-    def authenticate(self):
-        if not self.username or not self.password:
-            return False
-        try:
-            self.token = getToken(self.registry_url, self.username, self.password, self.port)
-            return True
-        except Exception:
-            return False
-
-    def fetch_catalog(self):
-        if not self.token:
-            if not self.authenticate():
-                return []
-        try:
-            images = fetch_catalog_v2(self.registry_url, self.username, self.password, self.port, self.token)
-            if images and "repositories" in images:
-                self.repositories = sorted(images["repositories"])
-            return self.repositories
-        except Exception:
-            return []
-
-    def fetch_tags(self, repo_name):
-        if not self.token:
-            if not self.authenticate():
-                return []
-        try:
-            token2 = getTokenForImageScope(self.registry_url, self.username, self.password, self.port, repo_name)
-            tags_data = get_tag_image(self.registry_url, self.username, self.password, self.port, token2, repo_name)
-            if tags_data and "tags" in tags_data:
-                return tags_data["tags"]
-            return []
-        except Exception:
-            return []
-
-    def run(self, stdscr):
-        curses.curs_set(0)
-        curses.start_color()
-        curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
-        curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
-        curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
-
-        if not self.username or not self.password:
-            self.get_credentials(stdscr)
-
-        if not self.authenticate():
-            self.show_message(stdscr, "Authentication failed. Check credentials.", error=True)
-            return
-
-        while True:
-            if self.current_view == "main":
-                self.repositories = self.fetch_catalog()
-                if not self.repositories:
-                    self.show_message(stdscr, "No repositories found.", error=True)
-                    return
-                self.main_menu(stdscr)
-            elif self.current_view == "tags":
-                self.tags_view(stdscr)
-            elif self.current_view == "quit":
-                return
-
-    def get_credentials(self, stdscr):
-        stdscr.clear()
-        h, w = stdscr.getmaxyx()
-        y = h // 2 - 5
-
-        stdscr.addstr(y, w // 2 - 15, "Quay Registry Client - Login", curses.A_BOLD)
-        stdscr.addstr(y + 2, w // 2 - 10, "Username: ")
-        stdscr.clrtoeol()
-        curses.echo()
-        username = stdscr.getstr(y + 2, w // 2 + 1, 30).decode('utf-8')
-        stdscr.addstr(y + 4, w // 2 - 10, "Password: ")
-        stdscr.clrtoeol()
-        password = stdscr.getstr(y + 4, w // 2 + 1, 30, ord('*')).decode('utf-8')
-        curses.noecho()
-
-        self.username = username
-        self.password = password
-        stdscr.clear()
-
-    def main_menu(self, stdscr):
-        while self.current_view == "main":
-            stdscr.clear()
-            h, w = stdscr.getmaxyx()
-
-            title = f"Repositories - {self.registry_url}:{self.port}"
-            stdscr.addstr(0, (w - len(title)) // 2, title, curses.A_BOLD | curses.color_pair(1))
-            stdscr.addstr(1, 0, "=" * (w - 1))
-
-            if not self.repositories:
-                self.show_message(stdscr, "No repositories found.", error=True)
-                return
-
-            visible_rows = h - 4
-            start_idx = max(0, self.selected_idx - visible_rows // 2)
-            end_idx = min(len(self.repositories), start_idx + visible_rows)
-
-            for i, repo in enumerate(self.repositories[start_idx:end_idx]):
-                y = 2 + i
-                if y >= h - 2:
-                    break
-                if start_idx + i == self.selected_idx:
-                    stdscr.addstr(y, 2, f"> {repo}", curses.A_REVERSE)
-                else:
-                    stdscr.addstr(y, 2, f"  {repo}")
-
-            status = f"Total: {len(self.repositories)} | Use arrow keys, Enter to view tags, 'q' to quit"
-            stdscr.addstr(h - 1, 0, status[:w - 1])
-
-            key = stdscr.getch()
-
-            if key == ord('q'):
-                self.current_view = "quit"
-            elif key == curses.KEY_UP:
-                self.selected_idx = max(0, self.selected_idx - 1)
-            elif key == curses.KEY_DOWN:
-                self.selected_idx = min(len(self.repositories) - 1, self.selected_idx + 1)
-            elif key == ord('\n') or key == curses.KEY_ENTER:
-                if 0 <= self.selected_idx < len(self.repositories):
-                    self.current_repo = self.repositories[self.selected_idx]
-                    self.current_tags = self.fetch_tags(self.current_repo)
-                    self.current_view = "tags"
-
-    def tags_view(self, stdscr):
-        while self.current_view == "tags":
-            stdscr.clear()
-            h, w = stdscr.getmaxyx()
-
-            title = f"Tags - {self.current_repo}"
-            stdscr.addstr(0, (w - len(title)) // 2, title, curses.A_BOLD | curses.color_pair(1))
-            stdscr.addstr(1, 0, "=" * (w - 1))
-
-            if not self.current_tags:
-                stdscr.addstr(3, 2, "No tags found.", curses.color_pair(3))
-            else:
-                visible_rows = h - 4
-                start_idx = max(0, self.selected_idx - visible_rows // 2)
-                end_idx = min(len(self.current_tags), start_idx + visible_rows)
-
-                for i, tag in enumerate(self.current_tags[start_idx:end_idx]):
-                    y = 2 + i
-                    if y >= h - 2:
-                        break
-                    if start_idx + i == self.selected_idx:
-                        stdscr.addstr(y, 2, f"> {tag}", curses.A_REVERSE)
-                    else:
-                        stdscr.addstr(y, 2, f"  {tag}")
-
-            status = f"Tags: {len(self.current_tags)} | Use arrow keys, 'b' to go back, 'q' to quit"
-            stdscr.addstr(h - 1, 0, status[:w - 1])
-
-            key = stdscr.getch()
-
-            if key == ord('q'):
-                self.current_view = "quit"
-            elif key == ord('b'):
-                self.selected_idx = 0
-                self.current_view = "main"
-            elif key == curses.KEY_UP:
-                self.selected_idx = max(0, self.selected_idx - 1)
-            elif key == curses.KEY_DOWN:
-                self.selected_idx = min(len(self.current_tags) - 1, self.selected_idx + 1)
-
-    def show_message(self, stdscr, message, error=False):
-        stdscr.clear()
-        h, w = stdscr.getmaxyx()
-        y = h // 2
-        color = curses.color_pair(3) if error else curses.color_pair(2)
-        stdscr.addstr(y, (w - len(message)) // 2, message, color)
-        stdscr.addstr(y + 2, (w - 20) // 2, "Press any key to exit...")
-        stdscr.getch()
-
