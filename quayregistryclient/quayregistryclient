@@ -4,6 +4,8 @@
 
 
 from urllib.parse import urlencode, quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 import requests, json, argparse, sys, re, signal,ssl, socket, os, base64, curses, time
 
 EXIT_TAG_NOT_FOUND=3
@@ -12,7 +14,7 @@ DELETE_ALL_COUNTDOWN=10
 # Cache of TLS trust checks, keyed by (host, port)
 ssl_already_verified={}
 debug=None
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # VERSION = "0.3" Adding quayapi stuff related to create delete changepassword of a user
 # VERSION = "0.4.0" TLS fallback for Python < 3.10 + per-host trust cache; working
@@ -20,6 +22,9 @@ VERSION = "0.4.0"
 #                  UnboundLocalError / infinite pagination loop); 10s countdown
 #                  before delete-all-repo; auto-prune (GC) policies in mirror-get;
 #                  dead code and unused variables removed.
+# VERSION = "0.5.0" read-only gc-audit: tags pending GC, blob presence check via
+#                  /v2 HEAD, sparse manifest children, auto-prune policies and
+#                  recent tag-deletion audit logs for ONE repository.
 
 def signal_handler(sig, frame):
     sys.exit(0)
@@ -702,6 +707,31 @@ CRED_FIELDS = {"external_registry_username"}
 
 SHOW_SECRETS = False
 
+# gc-audit: audit-log kinds that explain a tag disappearing.  Blob deletions
+# themselves are NOT audited by Quay (only stdout + the Prometheus counter).
+GC_AUDIT_LOG_KINDS = {
+    "autoprune_tag_delete",
+    "delete_tag",
+    "permanently_delete_tag",
+    "delete_repo",
+    "create_repository_autoprune_policy",
+    "update_repository_autoprune_policy",
+    "delete_repository_autoprune_policy",
+    "create_namespace_autoprune_policy",
+    "update_namespace_autoprune_policy",
+    "delete_namespace_autoprune_policy",
+}
+
+GC_AUDIT_MANIFEST_ACCEPT = ", ".join((
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.oci.artifact.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v1+prettyjws",
+    "*/*",
+))
+
 
 def mask_value(v):
     return "[REDACTED:%d chars]" % (len(v) if hasattr(v, "__len__") else 1)
@@ -1115,6 +1145,987 @@ def cmd_repo_view(registry_url, Port, imageName, username=None, password=None, t
     if str(d.get("state")) == "MIRROR":
         print("  -> state=MIRROR : pushes are REFUSED (oc-mirror must flip to NORMAL first, synthese 8.14)")
     return d
+
+
+def _gc_fmt_bytes(n):
+    if n is None:
+        return "?"
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024:
+            if unit == "B":
+                return "%d B" % n
+            return "%.1f %s" % (n, unit)
+        n /= 1024
+    return "%.1f PiB" % n
+
+
+def _gc_fmt_seconds(seconds):
+    if seconds is None:
+        return "?"
+    seconds = int(seconds)
+    if seconds % 86400 == 0:
+        return "%dd" % (seconds // 86400)
+    if seconds % 3600 == 0:
+        return "%dh" % (seconds // 3600)
+    return "%ds" % seconds
+
+
+def _gc_iso_ts(ts):
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _gc_v2_token_for_repo(registry_url, Port, imageName, username=None,
+                          password=None, token=None):
+    """Fetch a /v2 pull token without ever aborting the audit on failure."""
+    auth_url = _base_url(registry_url, Port) + "/v2/auth"
+    scope = "repository:%s:pull" % imageName.strip("/")
+    attempts = []
+    if username is not None or RAW_BASIC:
+        attempts.append(({"Authorization": basic_header(username, password)}, "basic"))
+    if token:
+        attempts.append(({"Authorization": "Bearer " + token}, "bearer"))
+    attempts.append(({}, "anonymous"))
+
+    last_error = "no registry credential"
+    for auth, mode in attempts:
+        headers = {"Accept": "application/json"}
+        headers.update(auth)
+        params = {"service": registry_url, "scope": scope}
+        if username:
+            params["account"] = username
+        try:
+            r = requests.get(auth_url, headers=headers, params=params, timeout=20)
+        except requests.exceptions.RequestException as exc:
+            last_error = "%s: %s" % (mode, exc)
+            continue
+        if r.status_code != 200:
+            last_error = "%s: HTTP %d" % (mode, r.status_code)
+            continue
+        try:
+            data = r.json()
+        except ValueError:
+            last_error = "%s: invalid JSON" % mode
+            continue
+        tok = data.get("token") or data.get("access_token")
+        if tok:
+            return tok, mode
+        last_error = "%s: no token in response" % mode
+    return None, last_error
+
+
+def _gc_v2_get_manifest(registry_url, Port, imageName, digest, v2token):
+    if not v2token:
+        return None, "no /v2 pull token"
+    url = (_base_url(registry_url, Port) + "/v2/" + imageName.strip("/")
+           + "/manifests/" + quote(digest, safe=':'))
+    headers = {"Accept": GC_AUDIT_MANIFEST_ACCEPT,
+               "Authorization": "Bearer " + v2token}
+    try:
+        r = requests.get(url, headers=headers, timeout=40, allow_redirects=True)
+    except requests.exceptions.RequestException as exc:
+        return None, "request failed: %s" % exc
+    if r.status_code == 200:
+        return r.content, None
+    return None, "HTTP %d" % r.status_code
+
+
+def _gc_head_blob(registry_url, Port, imageName, digest, v2token):
+    """Return {'status': present|missing|unchecked, 'size': int|None, 'detail': str}."""
+    if not v2token:
+        return {"status": "unchecked", "size": None,
+                "detail": "no /v2 pull token"}
+    url = (_base_url(registry_url, Port) + "/v2/" + imageName.strip("/")
+           + "/blobs/" + quote(digest, safe=':'))
+    headers = {"Authorization": "Bearer " + v2token}
+    try:
+        r = requests.head(url, headers=headers, timeout=40, allow_redirects=True)
+    except requests.exceptions.RequestException as exc:
+        return {"status": "unchecked", "size": None, "detail": "request failed: %s" % exc}
+
+    if r.status_code == 200:
+        size = r.headers.get("Content-Length")
+        try:
+            size = int(size) if size is not None else None
+        except ValueError:
+            size = None
+        return {"status": "present", "size": size, "detail": "HEAD 200"}
+    if r.status_code == 404:
+        return {"status": "missing", "size": None, "detail": "HEAD 404"}
+
+    # Some proxies dislike HEAD: fall back to a one-byte ranged GET.
+    if r.status_code in (405, 501):
+        try:
+            g = requests.get(url, headers=dict(headers, Range="bytes=0-0"),
+                             timeout=40, allow_redirects=True, stream=True)
+        except requests.exceptions.RequestException as exc:
+            return {"status": "unchecked", "size": None,
+                    "detail": "HEAD %d; GET failed: %s" % (r.status_code, exc)}
+        try:
+            if g.status_code in (200, 206):
+                size = None
+                content_range = g.headers.get("Content-Range", "")
+                if "/" in content_range:
+                    try:
+                        size = int(content_range.rsplit("/", 1)[1])
+                    except ValueError:
+                        size = None
+                elif g.headers.get("Content-Length"):
+                    try:
+                        size = int(g.headers["Content-Length"])
+                    except ValueError:
+                        size = None
+                return {"status": "present", "size": size,
+                        "detail": "ranged GET %d" % g.status_code}
+            return {"status": "unchecked", "size": None,
+                    "detail": "HEAD %d; GET %d" % (r.status_code, g.status_code)}
+        finally:
+            g.close()
+
+    if r.status_code in (401, 403):
+        return {"status": "unchecked", "size": None,
+                "detail": "HTTP %d: token lacks pull scope or was rejected" % r.status_code}
+    return {"status": "unchecked", "size": None, "detail": "HTTP %d" % r.status_code}
+
+
+def _gc_parse_manifest_document(parsed, digest=None, media_type=None,
+                                layers_override=None):
+    info = {
+        "digest": digest or (parsed.get("digest") if isinstance(parsed, dict) else None),
+        "media_type": media_type,
+        "is_index": False,
+        "children": [],
+        "layers": [],
+        "config": None,
+        "artifacts": [],
+        "schema1": False,
+        "source": None,
+        "metadata_broken": False,
+        "error": None,
+    }
+    if not isinstance(parsed, dict):
+        return info
+    if not info["media_type"]:
+        info["media_type"] = parsed.get("mediaType")
+
+    children = parsed.get("manifests")
+    if isinstance(children, list):
+        info["is_index"] = True
+        for entry in children:
+            if isinstance(entry, dict) and entry.get("digest"):
+                info["children"].append(entry["digest"])
+
+    # Prefer the manifest bytes (source of truth).  The API's `layers` list is
+    # built from DB rows and would be shorter if a ManifestBlob row is missing:
+    # exactly the situation gc-audit is trying to detect.
+    raw_layers = parsed.get("layers") if parsed.get("layers") else layers_override
+    if isinstance(raw_layers, list):
+        for layer in raw_layers:
+            if not isinstance(layer, dict):
+                continue
+            layer_digest = layer.get("blob_digest") or layer.get("digest")
+            if not layer_digest:
+                continue
+            size = layer.get("compressed_size", layer.get("size"))
+            try:
+                size = int(size) if size is not None else None
+            except (TypeError, ValueError):
+                size = None
+            info["layers"].append({
+                "digest": layer_digest,
+                "size": size,
+                "remote": bool(layer.get("urls") or layer.get("is_remote")),
+            })
+
+    config = parsed.get("config")
+    if isinstance(config, dict) and config.get("digest"):
+        size = config.get("size")
+        try:
+            size = int(size) if size is not None else None
+        except (TypeError, ValueError):
+            size = None
+        info["config"] = {"digest": config["digest"], "size": size}
+
+    blobs = parsed.get("blobs")
+    if isinstance(blobs, list):
+        for blob in blobs:
+            if not isinstance(blob, dict) or not blob.get("digest"):
+                continue
+            size = blob.get("size")
+            try:
+                size = int(size) if size is not None else None
+            except (TypeError, ValueError):
+                size = None
+            info["artifacts"].append({"digest": blob["digest"], "size": size})
+
+    # Docker schema 1 manifests use fsLayers and have no config descriptor.
+    fs_layers = parsed.get("fsLayers")
+    if not info["layers"] and isinstance(fs_layers, list):
+        info["schema1"] = True
+        for layer in fs_layers:
+            if isinstance(layer, dict) and layer.get("blobSum"):
+                info["layers"].append({
+                    "digest": layer["blobSum"], "size": None, "remote": False,
+                })
+
+    return info
+
+
+def _gc_audit_manifest(registry_url, Port, imageName, digest, username, password,
+                       token, v2token, cache):
+    if digest in cache:
+        return cache[digest]
+
+    info = {
+        "digest": digest, "media_type": None, "is_index": False, "children": [],
+        "layers": [], "config": None, "artifacts": [], "schema1": False,
+        "source": None, "metadata_broken": False, "error": None,
+    }
+    apipath = ("/api/v1/repository/" + quote(imageName.strip("/"), safe='/')
+               + "/manifest/" + quote(digest, safe=':'))
+    r = api_get(registry_url, Port, apipath, username, password, token)
+    if r.status_code == 200:
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        parsed = {}
+        parse_failed = False
+        raw = data.get("manifest_data")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                parsed = {}
+                parse_failed = True
+        info = _gc_parse_manifest_document(
+            parsed,
+            digest=data.get("digest") or digest,
+            media_type=parsed.get("mediaType") or data.get("config_media_type"),
+            layers_override=data.get("layers"),
+        )
+        info["source"] = "api"
+        info["metadata_broken"] = parse_failed
+        if data.get("is_manifest_list"):
+            info["is_index"] = True
+        if info["is_index"] and not info["children"]:
+            info["metadata_broken"] = True
+    else:
+        raw, v2_error = _gc_v2_get_manifest(registry_url, Port, imageName,
+                                            digest, v2token)
+        if raw is not None:
+            try:
+                parsed = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                parsed = {}
+            info = _gc_parse_manifest_document(parsed, digest=digest)
+            info["source"] = "v2"
+            info["metadata_broken"] = True
+            if not parsed:
+                info["error"] = "unparseable /v2 manifest"
+        else:
+            info["error"] = "API HTTP %s; /v2 %s" % (r.status_code, v2_error)
+
+    cache[digest] = info
+    return info
+
+
+def _gc_add_blob_ref(blob_refs, digest, size, remote, tag, tag_active,
+                     manifest_digest, kind):
+    if not digest:
+        return
+    if tag is None:
+        tag = "?"
+    ref = blob_refs.setdefault(digest, {
+        "digest": digest,
+        "size": None,
+        "remote": remote,
+        "tag_refs": set(),
+        "manifests": set(),
+        "kinds": set(),
+    })
+    if ref["size"] is None and size is not None:
+        ref["size"] = size
+    # A digest referenced by both a foreign layer and a local layer must be checked.
+    ref["remote"] = ref["remote"] and remote
+    ref["tag_refs"].add((tag, bool(tag_active)))
+    ref["manifests"].add(manifest_digest)
+    ref["kinds"].add(kind)
+
+
+def _gc_note_missing_child(ctx, parent, child, tag, error=None):
+    key = (parent, child)
+    entry = ctx["missing_children"].setdefault(key, {
+        "parent": parent, "digest": child, "tags": set(), "error": error,
+    })
+    entry["tags"].add(tag)
+    if error and not entry.get("error"):
+        entry["error"] = error
+
+
+def _gc_walk_manifest(ctx, digest, tag, depth=0, path=None, tag_active=True):
+    if depth > 8:
+        ctx["manifest_errors"].append({
+            "digest": digest, "tag": tag, "active": tag_active,
+            "error": "manifest tree deeper than 8 levels",
+        })
+        return False
+    if path is None:
+        path = set()
+    if digest in path:
+        return True
+
+    info = _gc_audit_manifest(
+        ctx["registry_url"], ctx["port"], ctx["image_name"], digest,
+        ctx["username"], ctx["password"], ctx["token"], ctx["v2token"],
+        ctx["cache"],
+    )
+    if info["error"]:
+        # A missing child of a manifest list is normal for sparse mirror
+        # manifests; only a root tag manifest is an actual audit failure.
+        if depth == 0:
+            ctx["manifest_errors"].append({
+                "digest": digest, "tag": tag, "active": tag_active,
+                "error": info["error"],
+            })
+        else:
+            ctx["manifest_child_errors"] = ctx.get("manifest_child_errors", {})
+            ctx["manifest_child_errors"][digest] = info["error"]
+        return False
+
+    if info["is_index"]:
+        if not info["children"]:
+            ctx["manifest_errors"].append({
+                "digest": digest, "tag": tag, "active": tag_active,
+                "error": "manifest list/index has no child digest",
+            })
+            return True
+        for child in info["children"]:
+            if not _gc_walk_manifest(ctx, child, tag, depth + 1,
+                                     path | {digest}, tag_active):
+                _gc_note_missing_child(
+                    ctx, digest, child, tag,
+                    (ctx.get("manifest_child_errors") or {}).get(child),
+                )
+        return True
+
+    for layer in info["layers"]:
+        _gc_add_blob_ref(ctx["blob_refs"], layer["digest"], layer["size"],
+                         layer["remote"], tag, tag_active, digest, "layer")
+    if info["config"]:
+        _gc_add_blob_ref(ctx["blob_refs"], info["config"]["digest"],
+                         info["config"]["size"], False, tag, tag_active,
+                         digest, "config")
+    for artifact in info["artifacts"]:
+        _gc_add_blob_ref(ctx["blob_refs"], artifact["digest"],
+                         artifact["size"], False, tag, tag_active,
+                         digest, "artifact")
+    return True
+
+
+def _gc_fetch_logs(registry_url, Port, imageName, username, password, token, days):
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    apipath = ("/api/v1/repository/" + quote(imageName.strip("/"), safe='/')
+               + "/logs")
+    params = {
+        "starttime": start.strftime("%m/%d/%Y"),
+        "endtime": end.strftime("%m/%d/%Y"),
+    }
+    result = {
+        "window_days": days,
+        "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "counts": {},
+        "events": [],
+        "pages": 0,
+        "unavailable": None,
+    }
+    for _ in range(50):
+        r = api_get(registry_url, Port, apipath, username, password, token,
+                    params=params)
+        if r.status_code != 200:
+            result["unavailable"] = "HTTP %d" % r.status_code
+            break
+        try:
+            data = r.json()
+        except ValueError:
+            result["unavailable"] = "invalid JSON"
+            break
+        if data.get("search_unavailable"):
+            result["unavailable"] = data.get("message") or "search unavailable"
+            break
+        result["pages"] += 1
+        for log in data.get("logs") or []:
+            kind = log.get("kind")
+            if kind not in GC_AUDIT_LOG_KINDS and "autoprune" not in (kind or ""):
+                continue
+            result["counts"][kind] = result["counts"].get(kind, 0) + 1
+            metadata = log.get("metadata") or {}
+            performer = (log.get("performer") or {}).get("name")
+            result["events"].append({
+                "datetime": log.get("datetime"),
+                "kind": kind,
+                "tag": metadata.get("tag"),
+                "performer": performer,
+            })
+        next_page = data.get("next_page")
+        if not next_page:
+            break
+        params["next_page"] = next_page
+    return result
+
+
+def _gc_print_text(result, only_problems=False, show_tags=False):
+    print("### GC audit: %s" % result["repository"])
+    print("  %-24s = %s" % ("state", result["state"]))
+    window = result["tag_expiration_s"]
+    print("  %-24s = %s%s" % (
+        "tag_expiration_s",
+        window if window is not None else "?",
+        " (%s)" % _gc_fmt_seconds(window) if window is not None else "",
+    ))
+    if window is None:
+        print("  ** tag_expiration_s unknown: GC-eligibility dates cannot be computed")
+    print("  %-24s = %s" % ("is_public", result["is_public"]))
+    print("  %-24s = %s" % ("generated_at", result["generated_at"]))
+    if result["state"] == "MARKED_FOR_DELETION":
+        print("  -> repository queued for deletion; the GC worker will purge it asynchronously")
+    if result["tags"]["truncated"]:
+        print("  ** tag list truncated at --max-tags %d" % result["tags"]["max_tags"])
+
+    print("")
+    print("### retention / auto-prune")
+    for label in ("repository", "organization"):
+        block = result["retention"][label]
+        if block.get("error"):
+            print("  %s policies: unavailable (%s)" % (label, block["error"]))
+        elif not block.get("policies"):
+            print("  %s policies: none" % label)
+        else:
+            print("  %s policies:" % label)
+            for policy in block["policies"]:
+                print("    - method=%s value=%s tagPattern=%r tagPatternMatches=%s"
+                      % (policy.get("method"), policy.get("value"),
+                         policy.get("tagPattern"), policy.get("tagPatternMatches")))
+
+    tags = result["tags"]
+    print("")
+    print("### tags")
+    print("  rows=%d unique_names=%d active_names=%d expired_rows=%d "
+          "(pending=%d gc_eligible=%d)"
+          % (tags["total"], tags["unique_names"], tags["active_names"],
+             tags["expired_rows"], tags.get("pending_rows",
+                                            tags["expired_pending_gc"]),
+             tags.get("gc_eligible_rows", tags["gc_eligible"])))
+    print("  one line per tag name; historical versions are summarized as history=N")
+
+    # Quay's tag API returns the full tag history: the same name can have one
+    # alive row plus several expired rows (one per re-target/reversion).  Keep
+    # one display line per name, and put the details in `history=N`.
+    groups = {}
+    for tag_item in tags["items"]:
+        groups.setdefault(tag_item["name"] or "?", []).append(tag_item)
+
+    shown = 0
+    for name, rows in groups.items():
+        active_rows = [item for item in rows if item["active"]]
+        eligible_rows = [item for item in rows if item["gc_eligible"]]
+        pending_rows = [
+            item for item in rows
+            if (not item["active"]) and (not item["gc_eligible"])]
+        eligible_count = len(eligible_rows)
+        pending_count = len(pending_rows)
+
+        if only_problems and active_rows and not (eligible_count or pending_count):
+            if not show_tags:
+                continue
+
+        if active_rows:
+            state = "active"
+            current = active_rows[0]
+        elif eligible_rows:
+            state = "gc-eligible"
+            current = eligible_rows[0]
+        elif pending_rows:
+            state = "pending"
+            current = pending_rows[0]
+        else:
+            state = "expired"
+            current = rows[0]
+
+        suffix = ""
+        if current["end_ts"] is not None:
+            if current["active"]:
+                suffix += " expires_at=%s" % _gc_iso_ts(current["end_ts"])
+            else:
+                suffix += " end_ts=%s gc_after=%s" % (
+                    _gc_iso_ts(current["end_ts"]),
+                    _gc_iso_ts(current["gc_eligible_at"]))
+        if len(rows) > 1:
+            suffix += " history=%d" % len(rows)
+        if eligible_count and not (state == "gc-eligible" and eligible_count == 1):
+            suffix += " gc_eligible_versions=%d" % eligible_count
+        if pending_count and not (state == "pending" and pending_count == 1):
+            suffix += " pending_versions=%d" % pending_count
+        if current.get("is_sparse"):
+            suffix += " sparse_children=%s/%s" % (
+                current.get("present_child_count"),
+                current.get("child_manifest_count"))
+
+        print("  %-30s %-11s digest=%s size=%s%s"
+              % (name, state, current["digest"],
+                 _gc_fmt_bytes(current["size"]), suffix))
+        shown += 1
+
+    if only_problems and shown == 0:
+        print("  (no expired, pending-GC or historical tag version)")
+
+    blobs = result["blobs"]
+    print("")
+    print("### blobs")
+    print("  check=%s registry_token=%s unique=%d present=%d missing=%d"
+          " size_mismatch=%d unchecked=%d skipped=%d bytes=%s"
+          % ("on" if blobs["checked"] else "off", blobs["registry_token"],
+             blobs["unique"], blobs["present"], blobs["missing"],
+             blobs["size_mismatch"], blobs["unchecked"], blobs["skipped"],
+             _gc_fmt_bytes(blobs["bytes_referenced"])))
+    if not blobs["checked"]:
+        print("  (metadata only: --no-blob-check)")
+    for item in blobs["items"]:
+        if item["status"] in ("present", "skipped"):
+            continue
+        print("  %-13s %s expected=%s actual=%s tags=%s manifests=%s"
+              % (item["status"].upper(), item["digest"],
+                 _gc_fmt_bytes(item["expected_size"]),
+                 _gc_fmt_bytes(item["actual_size"]),
+                 ",".join(item["tags"]) or "-",
+                 ",".join(item["manifests"]) or "-"))
+        if item.get("detail"):
+            print("                detail=%s" % item["detail"])
+
+    if result["sparse_manifests"]:
+        print("")
+        print("### sparse manifests (child manifests absent, not blob deletion)")
+        for item in result["sparse_manifests"]:
+            print("  parent=%s missing_child=%s tags=%s%s"
+                  % (item["parent"], item["digest"],
+                     ",".join(item["tags"]) or "-",
+                     " (%s)" % item["error"] if item.get("error") else ""))
+
+    if result["manifest_errors"]:
+        print("")
+        print("### manifest errors")
+        for item in result["manifest_errors"]:
+            print("  digest=%s tag=%s error=%s"
+                  % (item["digest"], item["tag"], item["error"]))
+
+    logs = result["logs"]
+    if logs is not None:
+        print("")
+        print("### tag/policy audit log (last %d days)" % logs["window_days"])
+        if logs["unavailable"]:
+            print("  unavailable: %s" % logs["unavailable"])
+        else:
+            if not logs["counts"]:
+                print("  no matching entries")
+            else:
+                print("  " + ", ".join("%s=%d" % (k, v)
+                                       for k, v in sorted(logs["counts"].items())))
+                for event in logs["events"][:20]:
+                    print("  %s  %-32s tag=%s performer=%s"
+                          % (event["datetime"], event["kind"],
+                             event["tag"] or "-", event["performer"] or "-"))
+
+    print("")
+    print("VERDICT: %s" % result["verdict"])
+    if result["problems"]:
+        for problem in result["problems"]:
+            print("  - %s" % problem["message"])
+    if result["warnings"]:
+        print("WARNINGS (expired tags only; informational):")
+        for warning in result["warnings"]:
+            print("  - %s" % warning["message"])
+    if tags["gc_eligible"]:
+        print("  - %d tag(s) are already eligible for GC (informational, not a failure)"
+              % tags["gc_eligible"])
+    if not result["blobs"]["checked"] and result["blobs"]["unique"]:
+        print("  - blob presence was not checked (--no-blob-check); verdict is INCOMPLETE")
+    if result["blobs"]["unchecked"]:
+        print("  - %d blob(s) could not be checked; verdict is INCOMPLETE, not OK"
+              % result["blobs"]["unchecked"])
+    if result["sparse_manifests"]:
+        print("  - %d sparse child manifest(s) absent (informational, not blob deletion)"
+              % len(result["sparse_manifests"]))
+
+
+def cmd_gc_audit(registry_url, Port, imageName, username=None, password=None,
+                 token=None, json_output=False, only_problems=False,
+                 blob_check=True, max_tags=200, logs_days=0, jobs=8,
+                 fail_on_problem=False, show_tags=False):
+    """
+    Read-only GC / blob audit for ONE repository.
+
+    The Quay API exposes no deleted-blob history and no per-repository GC
+    timestamp.  This command reconstructs what can be known:
+      * repository state and the namespace time-machine window;
+      * repository/organization auto-prune policies;
+      * tags, including expired ones still present, and their GC-eligibility;
+      * every blob referenced by those tags, checked with HEAD /v2/.../blobs/...;
+      * sparse manifest-list children and manifest metadata errors;
+      * optionally, recent tag-deletion audit entries.
+    """
+    imageName = imageName.strip("/")
+    if "/" not in imageName:
+        printstderr("** gc-audit needs -i <namespace/repository> (got %r)" % imageName)
+        return 2
+    try:
+        max_tags = max(0, int(max_tags))
+    except (TypeError, ValueError):
+        max_tags = 200
+    try:
+        logs_days = max(0, int(logs_days))
+    except (TypeError, ValueError):
+        logs_days = 0
+
+    org = imageName.split("/", 1)[0]
+    repo_path = quote(imageName, safe='/')
+    r = api_get(registry_url, Port, "/api/v1/repository/" + repo_path,
+                username, password, token, params={"includeTags": "false"})
+    if r.status_code != 200:
+        printstderr("** gc-audit: cannot read repository %s (HTTP %d): %s"
+                    % (imageName, r.status_code, (r.text or "")[:200]))
+        return 2
+    try:
+        repo_data = r.json()
+    except ValueError:
+        printstderr("** gc-audit: repository API returned invalid JSON")
+        return 2
+
+    state = repo_data.get("state")
+    tag_expiration_s = repo_data.get("tag_expiration_s")
+    try:
+        tag_expiration_s = int(tag_expiration_s) if tag_expiration_s is not None else None
+    except (TypeError, ValueError):
+        tag_expiration_s = None
+
+    def _policies(path):
+        rr = api_get(registry_url, Port, path, username, password, token)
+        if rr.status_code != 200:
+            return {"policies": [], "error": "HTTP %d" % rr.status_code}
+        try:
+            return {"policies": rr.json().get("policies") or [], "error": None}
+        except ValueError:
+            return {"policies": [], "error": "invalid JSON"}
+
+    retention = {
+        "repository": _policies("/api/v1/repository/" + repo_path + "/autoprunepolicy/"),
+        "organization": _policies("/api/v1/organization/" + quote(org, safe='')
+                                    + "/autoprunepolicy/"),
+    }
+
+    tags = []
+    page = 1
+    truncated = False
+    while True:
+        rr = api_get(
+            registry_url, Port,
+            "/api/v1/repository/" + repo_path + "/tag/",
+            username, password, token,
+            params={"onlyActiveTags": "false", "limit": 100, "page": page},
+        )
+        if rr.status_code != 200:
+            printstderr("** gc-audit: cannot list tags (HTTP %d): %s"
+                        % (rr.status_code, (rr.text or "")[:200]))
+            return 2
+        try:
+            data = rr.json()
+        except ValueError:
+            printstderr("** gc-audit: tag API returned invalid JSON")
+            return 2
+        chunk = data.get("tags") or []
+        for tag in chunk:
+            if max_tags and len(tags) >= max_tags:
+                truncated = True
+                break
+            tags.append(tag)
+        if truncated or not data.get("has_additional"):
+            break
+        page += 1
+        if page > 1000:
+            truncated = True
+            break
+
+    now_s = time.time()
+    tag_items = []
+    for tag in tags:
+        end_ts = tag.get("end_ts")
+        try:
+            end_ts = float(end_ts) if end_ts is not None else None
+        except (TypeError, ValueError):
+            end_ts = None
+        active = end_ts is None or end_ts > now_s
+        eligible_at = None
+        gc_eligible = False
+        if end_ts is not None and tag_expiration_s is not None:
+            eligible_at = end_ts + tag_expiration_s
+            gc_eligible = eligible_at <= now_s
+        tag_items.append({
+            "name": tag.get("name"),
+            "digest": tag.get("manifest_digest"),
+            "size": tag.get("size"),
+            "end_ts": end_ts,
+            "expiration": tag.get("expiration"),
+            "active": active,
+            "gc_eligible": gc_eligible,
+            "gc_eligible_at": eligible_at,
+            "immutable": tag.get("immutable"),
+            "is_sparse": tag.get("is_sparse"),
+            "present_child_count": tag.get("present_child_count"),
+            "child_manifest_count": tag.get("child_manifest_count"),
+        })
+
+    v2token = None
+    v2mode = "disabled"
+    if blob_check:
+        v2token, v2mode = _gc_v2_token_for_repo(
+            registry_url, Port, imageName, username, password, token)
+        if v2token is None and token:
+            # -T may itself be a registry JWT; try it rather than giving up.
+            v2token, v2mode = token, "raw -T bearer"
+        if v2token is None:
+            printstderr("** gc-audit: no /v2 pull token (%s); blobs will be UNCHECKED"
+                        % v2mode)
+
+    ctx = {
+        "registry_url": registry_url,
+        "port": Port,
+        "image_name": imageName,
+        "username": username,
+        "password": password,
+        "token": token,
+        "v2token": v2token,
+        "cache": {},
+        "blob_refs": {},
+        "missing_children": {},
+        "manifest_child_errors": {},
+        "manifest_errors": [],
+    }
+    for tag_item in tag_items:
+        if tag_item["digest"]:
+            _gc_walk_manifest(ctx, tag_item["digest"], tag_item["name"],
+                              tag_active=tag_item["active"])
+        else:
+            ctx["manifest_errors"].append({
+                "digest": None, "tag": tag_item["name"],
+                "active": tag_item["active"],
+                "error": "tag has no manifest digest",
+            })
+
+    blob_results = {}
+    if blob_check:
+        targets = [d for d, ref in ctx["blob_refs"].items() if not ref["remote"]]
+        if v2token is not None:
+            workers = max(1, int(jobs))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_gc_head_blob, registry_url, Port, imageName, d,
+                                v2token): d
+                    for d in targets
+                }
+                for future in as_completed(futures):
+                    digest = futures[future]
+                    try:
+                        blob_results[digest] = future.result()
+                    except Exception as exc:  # noqa: BLE001 - audit must continue
+                        blob_results[digest] = {
+                            "status": "unchecked", "size": None,
+                            "detail": "worker exception: %s" % exc,
+                        }
+        else:
+            for digest in targets:
+                blob_results[digest] = {
+                    "status": "unchecked", "size": None,
+                    "detail": "no /v2 pull token (%s)" % v2mode,
+                }
+        for digest, ref in ctx["blob_refs"].items():
+            if ref["remote"]:
+                blob_results[digest] = {
+                    "status": "unchecked", "size": None,
+                    "detail": "foreign layer (urls) -- not stored locally",
+                }
+    else:
+        for digest in ctx["blob_refs"]:
+            blob_results[digest] = {
+                "status": "skipped", "size": None, "detail": "--no-blob-check",
+            }
+
+    blob_items = []
+    counts = {"present": 0, "missing": 0, "size_mismatch": 0,
+              "unchecked": 0, "skipped": 0}
+    bytes_referenced = 0
+    for digest, ref in ctx["blob_refs"].items():
+        result = blob_results.get(digest, {
+            "status": "unchecked", "size": None, "detail": "not checked",
+        })
+        status = result["status"]
+        expected = ref["size"]
+        actual = result.get("size")
+        if status == "present" and expected is not None and actual is not None \
+                and expected != actual:
+            status = "size_mismatch"
+            result["detail"] = "expected %d bytes, got %d" % (expected, actual)
+        counts[status] = counts.get(status, 0) + 1
+        if expected is not None:
+            bytes_referenced += expected
+        tag_refs = ref["tag_refs"]
+        tags_for_blob = sorted({tag for tag, _active in tag_refs})
+        active_tags = sorted({tag for tag, active in tag_refs if active})
+        blob_items.append({
+            "digest": digest,
+            "status": status,
+            "expected_size": expected,
+            "actual_size": actual,
+            "remote": ref["remote"],
+            "tags": tags_for_blob,
+            "active_tags": active_tags,
+            "expired_tags": [tag for tag in tags_for_blob
+                             if tag not in active_tags],
+            "manifests": sorted(ref["manifests"]),
+            "kinds": sorted(ref["kinds"]),
+            "detail": result.get("detail"),
+        })
+    blob_items.sort(key=lambda item: (
+        {"missing": 0, "size_mismatch": 1, "unchecked": 2,
+         "present": 3, "skipped": 4}.get(item["status"], 9),
+        -(item["expected_size"] or 0),
+        item["digest"],
+    ))
+
+    problems = []
+    warnings = []
+    for item in blob_items:
+        target = problems if item["active_tags"] else warnings
+        tag_list = item["active_tags"] or item["expired_tags"]
+        extra = ""
+        if item["active_tags"] and item["expired_tags"]:
+            extra = " (also referenced by expired tag(s): %s)" % ", ".join(
+                item["expired_tags"])
+        elif not item["active_tags"]:
+            extra = " (expired tags only)"
+        if item["status"] == "missing":
+            target.append({
+                "kind": "missing_blob",
+                "digest": item["digest"],
+                "tags": tag_list,
+                "active_tags": item["active_tags"],
+                "expired_tags": item["expired_tags"],
+                "message": "blob %s referenced by %s is missing from storage%s"
+                           % (item["digest"], ", ".join(tag_list) or "?", extra),
+            })
+        elif item["status"] == "size_mismatch":
+            target.append({
+                "kind": "size_mismatch",
+                "digest": item["digest"],
+                "tags": tag_list,
+                "active_tags": item["active_tags"],
+                "expired_tags": item["expired_tags"],
+                "message": "blob %s has size %s, expected %s%s"
+                           % (item["digest"], _gc_fmt_bytes(item["actual_size"]),
+                              _gc_fmt_bytes(item["expected_size"]), extra),
+            })
+    for error in ctx["manifest_errors"]:
+        target = problems if error.get("active", True) else warnings
+        target.append({
+            "kind": "manifest_error",
+            "digest": error["digest"],
+            "tags": [error["tag"]],
+            "message": "manifest %s (tag %s) is unreadable: %s"
+                       % (error["digest"], error["tag"], error["error"]),
+        })
+
+    sparse_manifests = [
+        {"parent": item["parent"], "digest": item["digest"],
+         "tags": sorted(item["tags"]), "error": item.get("error")}
+        for item in ctx["missing_children"].values()
+    ]
+
+    logs = _gc_fetch_logs(registry_url, Port, imageName, username, password,
+                          token, logs_days) if logs_days > 0 else None
+
+    checked_blobs = counts["present"] + counts["missing"] + counts["size_mismatch"]
+    if problems:
+        verdict = "PROBLEM"
+    elif blob_items and (not blob_check or counts["unchecked"] > 0 or v2token is None):
+        verdict = "INCOMPLETE"
+    else:
+        verdict = "OK"
+
+    tag_groups = {}
+    for item in tag_items:
+        tag_groups.setdefault(item["name"] or "?", []).append(item)
+    result = {
+        "repository": imageName,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "state": state,
+        "is_public": repo_data.get("is_public"),
+        "tag_expiration_s": tag_expiration_s,
+        "retention": retention,
+        "tags": {
+            "total": len(tag_items),
+            "unique_names": len(tag_groups),
+            "active": sum(1 for item in tag_items if item["active"]),
+            "active_names": sum(
+                1 for rows in tag_groups.values() if any(item["active"] for item in rows)),
+            "expired_rows": sum(1 for item in tag_items if not item["active"]),
+            "expired_pending_gc": sum(
+                1 for item in tag_items if (not item["active"]) and not item["gc_eligible"]),
+            "pending_rows": sum(
+                1 for item in tag_items if (not item["active"]) and not item["gc_eligible"]),
+            "gc_eligible": sum(1 for item in tag_items if item["gc_eligible"]),
+            "gc_eligible_rows": sum(1 for item in tag_items if item["gc_eligible"]),
+            "max_tags": max_tags,
+            "truncated": truncated,
+            "items": tag_items,
+        },
+        "blobs": {
+            "checked": blob_check,
+            "registry_token": v2mode,
+            "unique": len(blob_items),
+            "present": counts["present"],
+            "missing": counts["missing"],
+            "size_mismatch": counts["size_mismatch"],
+            "unchecked": counts["unchecked"],
+            "skipped": counts["skipped"],
+            "checked_total": checked_blobs,
+            "bytes_referenced": bytes_referenced,
+            "items": blob_items,
+        },
+        "sparse_manifests": sparse_manifests,
+        "manifest_errors": ctx["manifest_errors"],
+        "logs": logs,
+        "problems": problems,
+        "warnings": warnings,
+        "verdict": verdict,
+    }
+
+    if json_output:
+        print(json.dumps(result, indent=2, sort_keys=False))
+    else:
+        _gc_print_text(result, only_problems=only_problems,
+                       show_tags=show_tags)
+
+    if fail_on_problem and problems:
+        return 1
+    return 0
 
 
 def lookup_credentials(registry_host, port="443"):
@@ -1664,6 +2675,9 @@ def display_help():
     print("  mirror-get                      : mirror config + GC/retention policies of ONE repo <-i org/repo>")
     print("  mirror-scan                     : per-repo mirror inventory of an org <-o org>")
     print("                                    + HEALTH / PERIMETRE / ROBOTS aggregates  [--only-problems] [--max-repos N]")
+    print("  gc-audit                        : read-only GC/blob audit of ONE repo <-i org/repo>")
+    print("                                    tags pending GC, auto-prune policies, missing blobs")
+    print("                                    [--only-problems] [--no-blob-check] [--json] [--logs-days N]")
     print("  org-exists                      : ORACLE (anonymous) <-o? no, --orgs a,b,c>")
     print("                                    200=exists / 404=absent; no org list is hardcoded")
     print("  search-v1                       : registry V1 search (what `podman search` calls)")
@@ -1721,7 +2735,7 @@ _quayregistryclient() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     cmd="${COMP_WORDS[1]}"
 
-    local commands="list-catalog list-tags list-all get-image-digest get-image-manifest get-blob delete-repo delete-tag delete-all-repo browse-api quay-api-discovery quay-api-listuser quay-api-delete-user quay-api-create-user quay-api-change-userpassword set-api-key-value get-server-certificate quay-config whoami list-org-repos org-robots repo-view mirror-get mirror-scan search-v1 org-exists interactive"
+    local commands="list-catalog list-tags list-all get-image-digest get-image-manifest get-blob delete-repo delete-tag delete-all-repo browse-api quay-api-discovery quay-api-listuser quay-api-delete-user quay-api-create-user quay-api-change-userpassword set-api-key-value get-server-certificate quay-config whoami list-org-repos org-robots repo-view mirror-get mirror-scan gc-audit search-v1 org-exists interactive"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "${commands}" -- ${cur}) )
@@ -1753,6 +2767,10 @@ _quayregistryclient() {
             return 0
             ;;
         -T|--token|-u|--username|-p|--password|-P|--port|-D|--digest|-a|--apipath|-K|--key|-V|--value)
+            COMPREPLY=()
+            return 0
+            ;;
+        --max-tags|--logs-days|--jobs)
             COMPREPLY=()
             return 0
             ;;
@@ -1848,6 +2866,9 @@ _get_options_for_command() {
             ;;
         mirror-scan)
             echo "-r -P -o -u -p -T -d --show-secrets --only-problems --max-repos --offset -h"
+            ;;
+        gc-audit)
+            echo "-r -P -i -u -p -T -d --json --only-problems --no-blob-check --max-tags --logs-days --jobs --fail-on-problem --show-tags -h"
             ;;
         search-v1)
             echo "-r -P -q --pages --desc -u -p -T -d -h"
@@ -2066,6 +3087,7 @@ SUBCOMMAND_DESCRIPTIONS = {
     'repo-view': 'Repository view: state NORMAL/MIRROR, description, tags.',
     'mirror-get': 'Mirror config + GC/retention policies of ONE repository.',
     'mirror-scan': 'Per-repo mirror inventory of an org with health/perimeter/robot aggregates.',
+    'gc-audit': 'Read-only GC/blob audit of ONE repository: tags pending GC, blob presence, sparse children.',
     'search-v1': 'Registry V1 search (what `podman search` calls).',
     'org-exists': 'Probe candidate organization names (200=exists / 404=absent).',
     'interactive': 'Browse repositories, tags and blobs in a ncurses UI.',
@@ -2087,8 +3109,15 @@ OPTION_HELP = {
     'debug': 'Enable debug mode',
     'show_secrets': 'Do not redact secrets in the output (default: masked)',
     'org': 'Organization name (e.g., myorg)',
-    'only_problems': 'Only show repositories whose mirror is not healthy',
+    'only_problems': 'Text output only: show unhealthy mirrors, or GC-relevant tags/blobs',
     'max_repos': 'Limit the number of repositories inspected (0 = all)',
+    'json': 'Machine-readable JSON output (gc-audit)',
+    'no_blob_check': 'Metadata only: do not HEAD blobs on /v2 (gc-audit)',
+    'max_tags': 'Maximum number of tags audited (0 = all)',
+    'logs_days': 'Fetch recent tag/policy audit logs for N days (0 = off)',
+    'jobs': 'Parallel blob HEAD requests',
+    'fail_on_problem': 'Exit 1 when missing blobs, size mismatches or manifest errors are found',
+    'show_tags': 'List active tags even with --only-problems',
     'offset': 'Skip the first N repositories (chunk long scans)',
     'query': 'Search term (empty = all)',
     'pages': 'Maximum number of pages (0 = all)',
@@ -2304,6 +3333,34 @@ def create_parser():
         if name == 'org-exists':
             sp.add_argument('--orgs', default='',
                             help='comma-separated candidate org names (required; no default)')
+
+    # ---- fork: read-only GC / blob audit for ONE repository ----
+    sp_gc = subparsers.add_parser(
+        'gc-audit',
+        help='read-only GC/blob audit of ONE repo: tags pending GC + missing blobs')
+    sp_gc.add_argument('-r', '--registry-url', required=True)
+    sp_gc.add_argument('-P', '--port', default='443')
+    sp_gc.add_argument('-u', '--username')
+    sp_gc.add_argument('-p', '--password')
+    sp_gc.add_argument('-T', '--token')
+    sp_gc.add_argument('-i', '--image-name', required=True, help='org/repo, e.g. myorg/myrepo')
+    sp_gc.add_argument('-d', '--debug', action='store_true')
+    sp_gc.add_argument('--json', action='store_true',
+                       help='machine-readable JSON on stdout (text output is disabled)')
+    sp_gc.add_argument('--only-problems', action='store_true',
+                       help='text output only: show only tags/blobs that need attention')
+    sp_gc.add_argument('--no-blob-check', action='store_true',
+                       help='metadata only: do not HEAD blobs on /v2')
+    sp_gc.add_argument('--max-tags', type=int, default=200,
+                       help='maximum number of tags audited (0 = all, default: 200)')
+    sp_gc.add_argument('--logs-days', type=int, default=0,
+                       help='also fetch tag-deletion audit logs for the last N days (0 = off)')
+    sp_gc.add_argument('--jobs', type=int, default=8,
+                       help='parallel blob HEAD requests (default: 8)')
+    sp_gc.add_argument('--fail-on-problem', action='store_true',
+                       help='exit 1 when missing blobs, size mismatches or manifest errors are found')
+    sp_gc.add_argument('--show-tags', action='store_true',
+                       help='list active tags even with --only-problems')
 
     sp_interactive = subparsers.add_parser('interactive', help='Launch interactive ncurses interface')
     sp_interactive.add_argument('-r', '--registry-url', required=True)
@@ -3055,7 +4112,7 @@ def main():
     # -T token) -- the stored /v2 credential is refused by the Quay frontend.
     # Fail once, up front, instead of printing misleading empty results.
     if cmd in ("whoami", "list-org-repos", "org-robots", "repo-view",
-               "mirror-get", "mirror-scan"):
+               "mirror-get", "mirror-scan", "gc-audit"):
         require_api_credential(token, username, password, registry_url, Port)
 
     if cmd == "get-server-certificate":
@@ -3204,6 +4261,20 @@ def main():
         cmd_mirror_scan(registry_url, Port, org, username, password, token,
                         only_problems=only_problems, max_repos=max_repos,
                         offset=getattr(args, 'offset', 0))
+    elif cmd == "gc-audit":
+        if not all([registry_url, Port, imageName]):
+            print("Error: gc-audit needs -r and -i <org/repo>"); sys.exit(2)
+        sys.exit(cmd_gc_audit(
+            registry_url, Port, imageName, username, password, token,
+            json_output=getattr(args, 'json', False),
+            only_problems=getattr(args, 'only_problems', False),
+            blob_check=not getattr(args, 'no_blob_check', False),
+            max_tags=getattr(args, 'max_tags', 200),
+            logs_days=getattr(args, 'logs_days', 0),
+            jobs=getattr(args, 'jobs', 8),
+            fail_on_problem=getattr(args, 'fail_on_problem', False),
+            show_tags=getattr(args, 'show_tags', False),
+        ))
     elif cmd == "org-exists":
         if not all([registry_url, Port]):
             print("Error: org-exists needs -r"); sys.exit(2)

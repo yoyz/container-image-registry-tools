@@ -9,7 +9,7 @@ nothing about *why*: which repositories actually exist, which ones are mirrors, 
 each mirror is synchronised against, which robot account it uses, and what a
 synchronisation error means once Quay has decrypted it.
 
-Current version: **0.4.0**.
+Current version: **0.5.0**.
 
 ## Features
 
@@ -19,6 +19,9 @@ Current version: **0.4.0**.
 * **Quay mirroring inventory** — per-repository mirror configuration plus health,
   perimeter and robot-account aggregates (`mirror-scan`), and the repository /
   organisation auto-prune (garbage-collection retention) policies (`mirror-get`).
+* **GC / blob audit** — read-only `gc-audit` for one repository: tags pending GC,
+  auto-prune policies, blob presence checked with `HEAD /v2/.../blobs/...`, sparse
+  manifest-list children and optional tag-deletion audit logs.
 * **Authentication** — Basic auth, bearer tokens, a Quay *session cookie*, and automatic
   discovery of credentials already stored by podman/docker. See
   [Authentication](#authentication).
@@ -118,6 +121,7 @@ turned off.
 | `repo-view` | `/api/v1/repository/<org>/<name>` | `-r -i` + API credential | read |
 | `mirror-get` | repository + mirror config + **auto-prune (GC) policies** | `-r -i` + API credential | read |
 | `mirror-scan` | per-repo mirror inventory, with `HEALTH` / `PERIMETRE` / `ROBOTS` aggregates | `-r -o` + API credential | read |
+| `gc-audit` | tags pending GC, auto-prune policies, blob presence via `/v2` `HEAD`, sparse children | `-r -i` + API credential (registry pull credential for blob checks) | read |
 | `browse-api` | any `/api/v1` path, `GET` | `-r -T -a` | read |
 | `quay-api-discovery` | `/api/v1/discovery` | `-r -T` | read |
 | `quay-api-listuser` | `/api/v1/superuser/users/` | `-r -T` | read |
@@ -143,10 +147,19 @@ Two notes on this table:
   [Web sign-in](#3-web-sign-in-session-cookie).
 
 > **Garbage collection.** Quay runs GC cluster-wide and the API exposes **no
-> per-repository GC timestamp**. The per-repository signals are the auto-prune
-> (retention) policies, which `mirror-get` now prints for both the repository and
-> its organisation, and the repository state: `MARKED_FOR_DELETION` (see
-> `repo-view`) means it is queued for GC.
+> per-repository GC timestamp** and **no deleted-blob history**. The per-repository
+> signals are the auto-prune (retention) policies, the time-machine window
+> (`tag_expiration_s`) and the repository state: `MARKED_FOR_DELETION` (see
+> `repo-view`) means it is queued for GC. `gc-audit` reconstructs what the API can
+> answer: tags already eligible for GC (`end_ts + tag_expiration_s`), tags still
+> inside the window, auto-prune policies, and whether the blobs referenced by the
+> tags still exist in storage. It cannot say *when* or *by what* a blob was deleted:
+> Quay only writes that to its own logs (`Removed blob ... under namespace ...`) and
+> to the Prometheus counter `quay_gc_storage_blobs_deleted`, which has no repository
+> label. A missing blob on an active tag is therefore a finding, not proof of a Quay
+> GC bug — check S3/GCS lifecycle rules and storage-side deletion too. See
+> [`doc/garbage_collection.md`](../doc/garbage_collection.md) for the full model
+> (time machine, auto-prune, manifest/blob deletion, API limits and `gc-audit`).
 
 ### Quirks this tool encodes
 
@@ -334,7 +347,7 @@ deletes nothing.
 | Code | Meaning |
 | --- | --- |
 | 0 | success |
-| 1 | certificate retrieval failure, or `delete-all-repo` without `--i-am-deleting-all-repo` |
+| 1 | certificate retrieval failure, `delete-all-repo` without `--i-am-deleting-all-repo`, or `gc-audit --fail-on-problem` with findings |
 | 2 | missing parameters |
 | 3 | credential refused by the registry at the token-grant step (`-d` shows the registry's own message; re-run `podman login`) |
 | 4 | command refused by [read-only mode](#read-only-mode) |
@@ -412,3 +425,50 @@ auto-prune (GC retention) policies of the repository and of its organisation.
 # 4. Keep only the mirrors that need attention
 ./quayregistryclient mirror-scan -r registry.example.com -o myorg --only-problems --max-repos 50
 ```
+
+### GC / blob audit
+
+`gc-audit` is the read-only diagnostic for “a tag exists but its layers are gone”
+(see also [`doc/garbage_collection.md`](../doc/garbage_collection.md)):
+
+```bash
+# Metadata + full blob presence check (HEAD /v2/.../blobs/<digest>)
+./quayregistryclient gc-audit -r registry.example.com -i myorg/app
+
+# CI-friendly: only the findings, exit 1 when a referenced blob is missing
+./quayregistryclient gc-audit -r registry.example.com -i myorg/app \
+    --only-problems --fail-on-problem
+
+# Fast metadata-only pass (no /v2 blob request), plus 7 days of tag-deletion logs
+./quayregistryclient gc-audit -r registry.example.com -i myorg/app \
+    --no-blob-check --logs-days 7
+
+# Machine-readable output
+./quayregistryclient gc-audit -r registry.example.com -i myorg/app --json
+```
+
+It prints:
+
+* repository `state`, `tag_expiration_s` and auto-prune policies (repository and
+  organisation);
+* tags with `end_ts`, plus the computed GC-eligibility date
+  `end_ts + tag_expiration_s`; the text output groups the full tag history by
+  name (one line per tag, `history=N` for older versions), while JSON keeps every
+  version in `tags.items`;
+* every unique blob digest referenced by the tags, checked with `HEAD` (status
+  `present`, `missing`, `size_mismatch`, `unchecked` or `skipped`) and the tags /
+  manifests that reference it;
+* sparse manifest-list children (missing child manifests, normal for sparse mirror
+  indexes) and manifest metadata errors;
+* optionally, recent `autoprune_tag_delete` / `delete_tag` audit entries.
+
+Blob checks need a `/v2` pull credential in addition to the `/api/v1` credential.
+It is acquired from `-u/-p`, the stored podman/docker credential, or an anonymous
+token grant for a public repository; without it the command still reports the
+metadata and marks the blobs `unchecked` (verdict `INCOMPLETE`, not `OK`).
+
+Options: `--json`, `--only-problems` (text output only; JSON stays complete),
+`--no-blob-check`, `--max-tags N` (default 200, `0` = all), `--logs-days N`
+(default `0`), `--jobs N` (default 8), `--fail-on-problem`, `--show-tags`. Exit
+codes: `0` no failure, `1` findings with `--fail-on-problem`, `2` fatal API/usage
+error.
