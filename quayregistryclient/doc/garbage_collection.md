@@ -680,7 +680,6 @@ un audit cross-repo, il faut interroger la base ou le stockage.
 
 ## 11. Références internes
 
-- [`quayregistryclient/README.md`](../quayregistryclient/README.md) — commandes,
-  authentification, mode read-only et `gc-audit`.
-- [`quayregistryclient/quayregistryclient`](../quayregistryclient/quayregistryclient)
-  — implémentation de `gc-audit`.
+- [`README.md`](../README.md) — commandes, authentification, mode read-only et
+  `gc-audit`.
+- [`quayregistryclient`](../quayregistryclient) — implémentation de `gc-audit`.

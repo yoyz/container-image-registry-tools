@@ -3,18 +3,30 @@
 
 
 
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode, quote, urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-import requests, json, argparse, sys, re, signal,ssl, socket, os, base64, curses, time, threading
+import requests, json, argparse, sys, re, signal,ssl, socket, os, base64, curses, time, threading, queue
 
 EXIT_TAG_NOT_FOUND=3
 EXIT_ABORTED=130
 DELETE_ALL_COUNTDOWN=10
+# Manifest media types accepted by the registry API. One request advertising all
+# of them avoids the old "try one type per request" loop (up to 4 round trips).
+MANIFEST_MEDIA_TYPES = (
+    'application/vnd.docker.distribution.manifest.list.v2+json',
+    'application/vnd.docker.distribution.manifest.v2+json',
+    'application/vnd.oci.image.index.v1+json',
+    'application/vnd.oci.image.manifest.v1+json',
+)
+MANIFEST_ACCEPT = ", ".join(MANIFEST_MEDIA_TYPES)
 # Cache of TLS trust checks, keyed by (host, port)
 ssl_already_verified={}
+# Cache of repository-scope tokens, keyed by (host, port, repository, account).
+# Tokens are kept until shortly before the registry-reported expiry.
+scope_token_cache={}
 debug=None
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 # VERSION = "0.3" Adding quayapi stuff related to create delete changepassword of a user
 # VERSION = "0.4.0" TLS fallback for Python < 3.10 + per-host trust cache; working
@@ -25,6 +37,12 @@ VERSION = "0.5.0"
 # VERSION = "0.5.0" read-only gc-audit: tags pending GC, blob presence check via
 #                  /v2 HEAD, sparse manifest children, auto-prune policies and
 #                  recent tag-deletion audit logs for ONE repository.
+# VERSION = "0.5.1" interactive mode made responsive: one request per manifest/digest,
+#                  connection + scope-token reuse, and tag counts fetched off the
+#                  UI thread instead of blocking every redraw. Add -A/--anonymous
+#                  browsing; harden search-v1 against off-registry redirects and
+#                  non-JSON (HTML) answers; add search-v2 (V2 catalog search);
+#                  reject unknown command-line arguments instead of ignoring them.
 
 def signal_handler(sig, frame):
     sys.exit(0)
@@ -337,24 +355,27 @@ def getblob(registry_url, username, password,Port,imageName,digest):
     blob=get_blob(registry_url, username, password,Port,token2,imageName,digest)
     print(blob, end="")
 
-def fetch_catalog_v2(registry_url, username, password,Port,token=None):
-    """Fetch the registry catalog, following the pagination Link headers.
+def _fetch_catalog_v2_pages(registry_url, Port, token=None, max_pages=0):
+    """Fetch the catalog and return (repositories, pages_fetched, truncated).
 
-    The token is optional: when it is None the request is sent anonymously.
-    Returns a dict like {"repositories": [...]}, or None on failure.
+    Follows the pagination Link headers.  ``max_pages=0`` means every page;
+    ``truncated`` is True when that limit stopped the crawl before the last
+    page.  Returns (None, 0, False) when the first page fails; a later-page
+    failure keeps the repositories already collected.  Never raises on a bad
+    page body.
     """
     if debug:
         printstderr("# fetch_catalog_v2")
     if checkhttpsconnection(registry_url,Port)==0:
-        return None
+        return None, 0, False
 
-    # username/password are kept in the signature for backward compatibility;
-    # authentication is carried by the Bearer token only.
+    # Authentication is carried by the Bearer token only; token=None means an
+    # anonymous request.
     headers = {
         'Content-Type': 'application/json',
         'Accept': 'application/json'
     }
-    if token is not None:
+    if token:
         headers['Authorization'] = "Bearer "+token
 
     url_short=_base_url(registry_url, Port)
@@ -363,30 +384,53 @@ def fetch_catalog_v2(registry_url, username, password,Port,token=None):
     if debug:
         log_python_request_curl_transform("GET",url,headers)
 
-    response = requests.get(url, headers=headers)
+    response = _http_session().get(url, headers=headers, timeout=30)
     if response.status_code != 200:
         printstderr(f"Failed to get images: {response.status_code}")
-        return None
+        return None, 0, False
 
     try:
         images = json.loads(response.text)
     except json.JSONDecodeError:
         printstderr("Failed to parse JSON response")
-        return None
+        return None, 0, False
 
-    while "Link" in response.headers:
+    repositories = list(images.get("repositories") or [])
+    pages = 1
+
+    while "Link" in response.headers and (max_pages <= 0 or pages < max_pages):
         next_re = re.search(r'<(.*)>', response.headers["Link"])
         if not next_re:
             break
         url = url_short + next_re.group(1)
-        response = requests.get(url, headers=headers)
+        response = _http_session().get(url, headers=headers, timeout=30)
         if response.status_code != 200:
             printstderr(f"Failed to get next images: {response.status_code}")
             break
-        images_next = json.loads(response.text)
-        images["repositories"] = images["repositories"] + images_next.get("repositories", [])
+        try:
+            images_next = json.loads(response.text)
+        except json.JSONDecodeError:
+            printstderr("Failed to parse JSON response for the next page")
+            break
+        repositories.extend(images_next.get("repositories") or [])
+        pages += 1
 
-    return images
+    truncated = bool(max_pages > 0 and pages >= max_pages
+                     and re.search(r'<(.*)>', response.headers.get("Link", "")))
+    return repositories, pages, truncated
+
+
+def fetch_catalog_v2(registry_url, username, password,Port,token=None,max_pages=0):
+    """Fetch the registry catalog, following the pagination Link headers.
+
+    The token is optional: when it is None the request is sent anonymously.
+    Returns a dict like {"repositories": [...]}, or None on failure.
+    """
+    repositories, _pages, _truncated = _fetch_catalog_v2_pages(
+        registry_url, Port, token=token, max_pages=max_pages)
+    if repositories is None:
+        return None
+    return {"repositories": repositories}
 
 
 def fetch_catalog_v2_token(registry_url,Port,token=None):
@@ -405,20 +449,21 @@ def get_tag_image(registry_url, username, password,Port,token,imageName):
     images=None
     headers = {
         'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': "Bearer "+token
+        'Accept': 'application/json'
     }
+    if token:
+        headers['Authorization'] = "Bearer "+token
     url="https://"+registry_url+":"+Port+"/v2/"+imageName+"/tags/list"
     if debug:
         log_python_request_curl_transform("GET",url,headers)
-    response = requests.get(url, headers=headers)
+    response = _http_session().get(url, headers=headers, timeout=30)
     if response.status_code == 200:
        images = json.loads(response.text)
        #print(response.headers)
        #print(response.text)
     else:
-        print("Failed to get images:", response.status_code)
-        print("Failed to get images:", response.headers)
+        printstderr("Failed to get images: %d" % response.status_code)
+        printstderr("Failed to get images: %s" % response.headers)
     return(images)
         
 
@@ -453,70 +498,62 @@ def get_blob(registry_url, username, password,Port,token,imageName,digest):
 def get_manifestlist(registry_url, username, password,Port,token,imageName,digest):
     if debug:
         printstderr("# get_manifestlist")
-    found=0
-    manifestListDigest=None
-    manifestReturned=""
+    # FIX: advertise every accepted media type in ONE Accept header. The old
+    # loop issued up to 4 GETs (and re-downloaded the manifest each time) just
+    # to discover its type, which made expanding a tag painfully slow.
+    headers =    {
+        'Content-Type': 'application/json',
+        'Accept': MANIFEST_ACCEPT
+    }
+    if token:
+        headers['Authorization'] = "Bearer "+token
+    url="https://"+registry_url+":"+Port+"/v2/"+imageName+"/manifests/"+digest
+    if debug:
+        log_python_request_curl_transform("GET",url,headers)
+    response = _http_session().get(url, headers=headers, timeout=40)
+    content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
+    if response.status_code == 200:
+        if content_type in MANIFEST_MEDIA_TYPES:
+            return response.text
+        # Some registries answer a valid manifest with a generic Content-Type;
+        # accept it rather than failing after a 200.
+        try:
+            if json.loads(response.text).get("schemaVersion") == 2:
+                return response.text
+        except (ValueError, AttributeError):
+            pass
 
-    for manifest_type in [ 'application/vnd.docker.distribution.manifest.list.v2+json',
-                           'application/vnd.docker.distribution.manifest.v2+json',
-                           'application/vnd.oci.image.index.v1+json',
-                           'application/vnd.oci.image.manifest.v1+json']:
-
-        headers =    {
-            'Content-Type': 'application/json',
-            'Accept': manifest_type,
-            'Authorization': "Bearer "+token
-        }
-        url="https://"+registry_url+":"+Port+"/v2/"+imageName+"/manifests/"+digest
-        if debug:
-            log_python_request_curl_transform("GET",url,headers)
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200 and response.headers['Content-Type'] == manifest_type and found==0:
-            manifestListDigest=response.text
-            found=1
-            break
-        
-    if (found == 0):
-        print("Failed to get images, status_code: %d header: %s, manifestReturned: %s" % ( response.status_code, response.headers, manifestReturned))
-    return(manifestListDigest)
+    printstderr("Failed to get images, status_code: %d header: %s, manifestReturned: %s" % (
+        response.status_code, response.headers, content_type or response.text[:120]))
+    return None
 
 
 
 def get_manifest_list_image_digest(registry_url, username, password,Port,token,imageName,tag):
     if debug:
         printstderr("# get_manifestlist")
-    found=0
-    manifestListDigest=None
-    manifestReturned=""
+    # FIX: same as get_manifestlist: a HEAD with the combined Accept header
+    # resolves the digest in one round trip instead of four.
+    headers =    {
+        'Accept': MANIFEST_ACCEPT
+    }
+    if token:
+        headers['Authorization'] = "Bearer "+token
+    url="https://"+registry_url+":"+Port+"/v2/"+imageName+"/manifests/"+tag
+    if debug:
+        log_python_request_curl_transform("HEAD",url,headers)
 
-    for manifest_type in [ 'application/vnd.docker.distribution.manifest.list.v2+json',
-                           'application/vnd.docker.distribution.manifest.v2+json',
-                           'application/vnd.oci.image.index.v1+json',
-                           'application/vnd.oci.image.manifest.v1+json']:
+    response = _http_session().head(url, headers=headers, timeout=20)
+    digest = response.headers.get("Docker-Content-Digest")
+    if response.status_code == 200 and digest:
+        return digest
 
-        headers =    {            
-            'Accept': manifest_type,
-            'Authorization': "Bearer "+token
-        }
-        url="https://"+registry_url+":"+Port+"/v2/"+imageName+"/manifests/"+tag
-        if debug:
-            log_python_request_curl_transform("GET",url,headers)
-
-        response = requests.head(url, headers=headers)
-        if response.status_code == 200 and response.headers['Content-Type'] == manifest_type and found==0:
-            manifestListDigest=response.headers["Docker-Content-Digest"]
-            #print(response.headers)
-            found=1
-        manifestReturned=manifestReturned+" "+response.headers['Content-Type']                   
-    
-    if found == 0:
-        status_code = response.status_code if response is not None else "N/A"
-        headers = response.headers if response is not None else {}
-        printstderr(
-            "Failed to get digest: status_code=%s headers=%s content_types_seen=%s"
-            % (status_code, headers, manifestReturned.strip())
-        )
-    return manifestListDigest
+    content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
+    printstderr(
+        "Failed to get digest: status_code=%s headers=%s content_types_seen=%s"
+        % (response.status_code, response.headers, content_type)
+    )
+    return None
 
 
 def getToken(registry_url, username, password,Port):
@@ -539,7 +576,7 @@ def getToken(registry_url, username, password,Port):
                           lambda m: "%s=<masked:%d>" % (m.group(1), len(m.group(2))),
                           url)
         printstderr("# token request: " + safe_url)
-    response = requests.get(url, headers=headers)
+    response = _http_session().get(url, headers=headers, timeout=25)
     if response.status_code == 200:
        json_token = json.loads(response.text)
        token=json_token["token"]
@@ -553,8 +590,51 @@ def getToken(registry_url, username, password,Port):
         sys.exit(3)
     return token
 
-def getTokenForImageScope(registry_url, username, password,Port,imageName):
+def _get_anonymous_token(registry_url, Port, scope=None, timeout=25):
+    """Try the anonymous token grant.
+
+    Public registries commonly answer /v2/auth without any Authorization
+    header and issue a pull token (Quay does this for public repositories).
+    Returns (token, ttl) or (None, 0); never raises, so callers can fall back
+    to a plain unauthenticated request.
+    """
+    options = {'service': registry_url}
+    if scope:
+        options['scope'] = scope
+    url = _base_url(registry_url, Port) + "/v2/auth?" + urlencode(options)
+    if debug:
+        printstderr("# anonymous token request (no credentials)")
+    try:
+        response = _http_session().get(url, headers={'Accept': 'application/json'},
+                                       timeout=timeout)
+        if response.status_code == 200:
+            data = response.json()
+            token = data.get("token") or data.get("access_token")
+            try:
+                ttl = float(data.get("expires_in", 300))
+            except (TypeError, ValueError):
+                ttl = 300.0
+            if token:
+                return token, ttl
+    except Exception:
+        pass
+    return None, 0
+
+
+def getTokenForImageScope(registry_url, username, password,Port,imageName,anonymous=False):
     token=None
+    cache_key=(registry_url, str(Port), imageName, None if anonymous else username)
+    cached=scope_token_cache.get(cache_key)
+    if cached and cached[1] > time.time():
+        return cached[0]
+    if anonymous:
+        token, ttl = _get_anonymous_token(
+            registry_url, Port, scope='repository:'+imageName+':pull')
+        if token and ttl > 60:
+            if len(scope_token_cache) > 512:
+                scope_token_cache.clear()
+            scope_token_cache[cache_key]=(token, time.time()+ttl-30)
+        return token
     # FIX: same latin-1 Basic-auth bug as getToken().
     headers = { 'Content-Type': 'application/json', 'Accept': 'application/json',
                 'Authorization': basic_header(username, password) }
@@ -563,10 +643,21 @@ def getTokenForImageScope(registry_url, username, password,Port,imageName):
 
     options_urlencoded=urlencode(options)
     url=_base_url(registry_url,Port)+"/v2/auth?"+options_urlencoded
-    response = requests.get(url, headers=headers)
+    response = _http_session().get(url, headers=headers, timeout=25)
     if response.status_code == 200:
        json_token = json.loads(response.text)
        token=json_token["token"]
+       # Cache the token so browsing a repo does not re-request it for its
+       # tags, its digest and every manifest. Default to 5 min when the
+       # registry does not report expires_in; refresh 30 s early.
+       try:
+           ttl=float(json_token.get("expires_in", 300))
+       except (TypeError, ValueError):
+           ttl=300.0
+       if ttl > 60:
+           if len(scope_token_cache) > 512:
+               scope_token_cache.clear()
+           scope_token_cache[cache_key]=(token, time.time()+ttl-30)
     else:
         printstderr("Can not get a token for scope repository:%s:pull (HTTP %d): %s" % (
             imageName, response.status_code, (response.text or '')[:160].replace('\n',' ')))
@@ -2631,6 +2722,29 @@ def _extract_pair(reg_data):
     return None
 
 
+def _natural_key(value):
+    """Sort postgresql-9 before postgresql-10/12, case-insensitively."""
+    return [int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", str(value))]
+
+
+def _search_json(response, what):
+    """Parse a V1-search JSON body, or explain why it is not one."""
+    ctype = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    try:
+        data = response.json()
+    except ValueError:
+        printstderr("** %s did not return JSON (HTTP %d, Content-Type: %s)"
+                    % (what, response.status_code, ctype or "?"))
+        printstderr("   This registry does not implement the deprecated V1 search API")
+        printstderr("   (Docker Hub redirects /v1/search to an HTML page).")
+        return None
+    if not isinstance(data, dict):
+        printstderr("** %s returned unexpected JSON (%s)" % (what, type(data).__name__))
+        return None
+    return data
+
+
 def cmd_search_v1(registry_url, Port, term, username=None, password=None,
                   token=None, pages_wanted=0, show_desc=False):
     """
@@ -2651,15 +2765,25 @@ def cmd_search_v1(registry_url, Port, term, username=None, password=None,
         hdrs['Authorization'] = "Bearer " + token
 
     # v1 is served over plain http on 80 in the spec, but Quay serves it on 443.
-    r = requests.get(base + "/v1/search", headers=hdrs,
-                     params={"q": term or "", "n": 100}, timeout=30)
+    # Do NOT follow redirects blindly: docker.io sends /v1/search to
+    # www.docker.com, which answers 200 + HTML and used to crash on r.json().
+    r = _http_session().get(base + "/v1/search", headers=hdrs,
+                            params={"q": term or "", "n": 100}, timeout=30,
+                            allow_redirects=False)
     if r.status_code in (301, 302, 307, 308):
-        loc = r.headers.get("Location", "")
-        if loc:
-            r = requests.get(loc, headers=hdrs, timeout=30)
+        loc = urljoin(base + "/", r.headers.get("Location", ""))
+        if not loc or urlparse(loc).netloc != urlparse(base).netloc:
+            printstderr("** /v1/search redirects off-registry to %s"
+                        % (loc or "an empty Location"))
+            printstderr("   refusing to follow: this registry does not expose "
+                        "the V1 search API")
+            return None
+        r = _http_session().get(loc, headers=hdrs, timeout=30)
     if not describe_response(r, "/v1/search?q=%r" % term):
         return None
-    d = r.json()
+    d = _search_json(r, "/v1/search?q=%r" % term)
+    if d is None:
+        return None
     results = list(d.get("results") or d.get("result") or [])
     npages = int(d.get("num_pages") or 1)
     page = int(d.get("page") or 1)
@@ -2669,13 +2793,15 @@ def cmd_search_v1(registry_url, Port, term, username=None, password=None,
     pages_fetched = 1
     while page < npages and (pages_wanted == 0 or page < pages_wanted):
         page += 1
-        rr = requests.get(base + "/v1/search", headers=hdrs,
-                          params={"q": term or "", "page": page, "n": 100},
-                          timeout=30)
+        rr = _http_session().get(base + "/v1/search", headers=hdrs,
+                                  params={"q": term or "", "page": page, "n": 100},
+                                  timeout=30)
         if rr.status_code != 200:
             printstderr("** page %d -> HTTP %d, stopping" % (page, rr.status_code))
             break
-        dd = rr.json()
+        dd = _search_json(rr, "/v1/search page %d" % page)
+        if dd is None:
+            break
         rs = dd.get("results") or dd.get("result") or []
         if not rs:
             break
@@ -2688,10 +2814,6 @@ def cmd_search_v1(registry_url, Port, term, username=None, password=None,
         name = item.get("name") or item.get("repo_name")
         if name:
             by_name[name] = item
-
-    def _natural_key(value):
-        return [int(part) if part.isdigit() else part.lower()
-                for part in re.split(r"(\d+)", str(value))]
 
     ordered = [by_name[name] for name in sorted(by_name, key=_natural_key)]
 
@@ -2732,6 +2854,52 @@ def cmd_search_v1(registry_url, Port, term, username=None, password=None,
         print("  entry keys: %s" % sorted(results[0].keys()))
     print("# total: %d result(s) from %d page(s)" % (len(ordered), pages_fetched))
     return ordered
+
+
+def cmd_search_v2(registry_url, Port, term, username=None, password=None,
+                  token=None, anonymous=False, max_pages=0):
+    """Podman-style "V2 search": enumerate /v2/_catalog and filter locally.
+
+    The Docker Registry V2 protocol has no search endpoint.  `podman search`
+    falls back to paging through /v2/_catalog and matching repository names,
+    and this command does the same.  The catalog contains no descriptions, so
+    the output is a NAME column only.
+
+    anonymous=True skips credentials entirely (anonymous token grant first,
+    then a plain unauthenticated GET).  Without it, credentials supplied via
+    -u/-p or a stored podman/docker credential are used when available; an
+    empty credential set also ends up anonymous.
+    """
+    if anonymous:
+        token = None
+        anon_token, _ttl = _get_anonymous_token(registry_url, Port)
+        if anon_token:
+            token = anon_token
+    elif token is None and (username is not None or password is not None):
+        token = getToken(registry_url, username, password, Port)
+
+    repositories, pages, truncated = _fetch_catalog_v2_pages(
+        registry_url, Port, token=token, max_pages=max_pages)
+    if repositories is None:
+        return None
+
+    needle = (term or "").lower()
+    matches = sorted({repo for repo in repositories if needle in repo.lower()},
+                     key=_natural_key)
+
+    print("### /v2/_catalog q=%r  results=%d  pages=%d"
+          % (term or "*", len(matches), pages))
+    if not matches:
+        print("  (no result)")
+    else:
+        name_width = max(len("NAME"), max(len(name) for name in matches))
+        print(("  %-*s" % (name_width, "NAME")).rstrip())
+        for name in matches:
+            print(("  %-*s" % (name_width, name)).rstrip())
+    print("# total: %d result(s) from %d catalog page(s)%s"
+          % (len(matches), pages,
+             " (truncated by --pages %d)" % max_pages if truncated else ""))
+    return matches
 
 
 def v2_credential_accepted(registry_url, Port, auth_header, timeout=15):
@@ -3048,6 +3216,7 @@ def display_help():
             ("get-image-manifest", "raw manifest JSON (-i, -D)"),
             ("get-blob", "download a blob (-i, -D)"),
             ("search-v1", "registry V1 search (what podman search uses)"),
+            ("search-v2", "V2 catalog search: page /v2/_catalog and filter names (anonymous with -A)"),
             ("interactive", "ncurses browser for repositories, tags, manifests and blobs"),
         ]),
         ("Quay API and inventory", [
@@ -3100,6 +3269,7 @@ def display_help():
         ("-K, --key KEY", "key for set-api-key-value"),
         ("-V, --value VALUE", "value for set-api-key-value"),
         ("-q, --query TERM", "search term for search-v1"),
+        ("-A, --anonymous", "interactive/search-v2: browse or search without credentials when the registry allows it"),
         ("-d, --debug", "print equivalent curl commands and diagnostics on stderr"),
         ("--show-secrets", "do not redact secret-bearing API fields"),
     ])
@@ -3113,6 +3283,7 @@ def display_help():
     print("Examples:")
     print("  %s search-v1 -r quay.io -q ubi" % prog)
     print("  %s search-v1 -r quay.io -q postgres --pages 2 --desc" % prog)
+    print("  %s search-v2 -r registry.fedoraproject.org -q http -A" % prog)
 
 
 def generate_bash_completion():
@@ -3127,7 +3298,7 @@ _quayregistryclient() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     cmd="${COMP_WORDS[1]}"
 
-    local commands="list-catalog list-tags list-all get-image-digest get-image-manifest get-blob delete-repo delete-tag delete-all-repo browse-api quay-api-discovery quay-api-listuser quay-api-delete-user quay-api-create-user quay-api-change-userpassword set-api-key-value get-server-certificate quay-config whoami list-organizations list-org-repos org-robots repo-view mirror-get mirror-scan gc-audit search-v1 org-exists interactive"
+    local commands="list-catalog list-tags list-all get-image-digest get-image-manifest get-blob delete-repo delete-tag delete-all-repo browse-api quay-api-discovery quay-api-listuser quay-api-delete-user quay-api-create-user quay-api-change-userpassword set-api-key-value get-server-certificate quay-config whoami list-organizations list-org-repos org-robots repo-view mirror-get mirror-scan gc-audit search-v1 search-v2 org-exists interactive"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "${commands}" -- ${cur}) )
@@ -3166,7 +3337,7 @@ _quayregistryclient() {
             COMPREPLY=()
             return 0
             ;;
-        -d|-h|--persist-connection|--no-persist-connection)
+        -d|-h|--persist-connection|--no-persist-connection|-A|--anonymous)
             COMPREPLY=()
             return 0
             ;;
@@ -3268,8 +3439,14 @@ _get_options_for_command() {
         search-v1)
             echo "-r -P -q --pages --desc -u -p -T -d -h"
             ;;
+        search-v2)
+            echo "-r -P -q --pages -A --anonymous -u -p -T -d -h"
+            ;;
         org-exists)
             echo "-r -P --orgs -d -h"
+            ;;
+        interactive)
+            echo "-r -P -u -p -A --anonymous -d -h"
             ;;
         *)
             echo "-r -P -u -p -i -t -T -D -a -K -V -d -h"
@@ -3485,6 +3662,7 @@ SUBCOMMAND_DESCRIPTIONS = {
     'mirror-scan': 'Per-repo mirror inventory of an org with health/perimeter/robot aggregates.',
     'gc-audit': 'Read-only GC/blob audit of ONE repository or every repository of an org.',
     'search-v1': 'Registry V1 search (what `podman search` calls).',
+    'search-v2': 'V2 catalog search: page /v2/_catalog and filter names locally (podman fallback).',
     'org-exists': 'Probe candidate organization names (200=exists / 404=absent).',
     'interactive': 'Browse repositories, tags and blobs in a ncurses UI.',
 }
@@ -3724,6 +3902,7 @@ def create_parser():
         ('mirror-get', 'mirror config of ONE repo: sync_status, external_reference, robot (synthese 9.1)'),
         ('mirror-scan', 'per-repo mirror inventory of an org + HEALTH/PERIMETRE/ROBOTS aggregates (synthese 5.9)'),
         ('search-v1', 'registry V1 search (what `podman search` calls) - the working enumeration here'),
+        ('search-v2', 'V2 catalog search: page /v2/_catalog and filter names locally (podman fallback)'),
         ('org-exists', 'ORACLE (anonymous): probe candidate org names, 200=exists / 404=absent'),
     ]:
         sp = subparsers.add_parser(
@@ -3758,6 +3937,13 @@ def create_parser():
             sp.add_argument('-q', '--query', default='', help='search term (empty = all)')
             sp.add_argument('--pages', type=int, default=0, help='max pages (0 = all)')
             sp.add_argument('--desc', action='store_true', help='show descriptions')
+        if name == 'search-v2':
+            sp.add_argument('-q', '--query', default='',
+                            help='search term matched against repository names (empty = all)')
+            sp.add_argument('--pages', type=int, default=0,
+                            help='max catalog pages (0 = all)')
+            sp.add_argument('-A', '--anonymous', action='store_true',
+                            help='search without credentials (open/public catalogs only)')
         if name == 'org-exists':
             sp.add_argument('--orgs', default='',
                             help='comma-separated candidate org names (required; no default)')
@@ -3808,6 +3994,8 @@ def create_parser():
     sp_interactive.add_argument('-P', '--port', default='443')
     sp_interactive.add_argument('-u', '--username')
     sp_interactive.add_argument('-p', '--password')
+    sp_interactive.add_argument('-A', '--anonymous', action='store_true',
+                                help='browse without credentials (only if the registry allows anonymous /v2 access)')
     sp_interactive.add_argument('-d', '--debug', action='store_true')
 
     _apply_subcommand_help(subparsers)
@@ -3826,12 +4014,14 @@ class TreeNode:
 
 
 class QueryLoop:
-    def __init__(self, registry_url, port, username, password, debug=False):
+    def __init__(self, registry_url, port, username, password, debug=False,
+                 anonymous=False):
         self.registry_url = registry_url
         self.port = port
         self.username = username
         self.password = password
         self.debug = debug
+        self.anonymous = anonymous
         self.token = None
         self.root = None
         self.visible_nodes = []
@@ -3840,52 +4030,92 @@ class QueryLoop:
         self.search_active = False
         self.search_matches = []
         self.current_match = 0
+        # Keep-alive HTTP session for the UI thread. The helpers below use
+        # _http_session(), which is thread-local, so the background tag-count
+        # workers get their own connection without sharing this one.
+        self.session = _http_session()
+        # Per-session caches: a node is loaded once and the data is reused by
+        # the renderer, the details view and the size calculation.
+        self._catalog = None
+        self._tags_cache = {}
+        self._digest_cache = {}
+        self._manifest_cache = {}
+        self._repo_info_cache = {}
+        # Tag counts are fetched in the background so the first paint and every
+        # keypress never wait for the network. Daemon workers are used on
+        # purpose: quitting must not wait for an in-flight HTTP request.
+        self._tag_counts = {}
+        self._tag_count_pending = set()
+        self._tag_count_updated = threading.Event()
+        self._tag_count_queue = queue.Queue()
+        self._tag_workers = []
 
     def authenticate(self):
+        if self.anonymous:
+            # No credential to check. fetch_catalog() tries an anonymous
+            # service token, then falls back to a plain unauthenticated GET.
+            return True
         if not self.username or not self.password:
             return False
         try:
             self.token = getToken(self.registry_url, self.username, self.password, self.port)
             return True
-        except Exception:
+        except (Exception, SystemExit):
             return False
 
     def fetch_catalog(self):
-        if not self.token:
-            if not self.authenticate():
-                return []
+        if self._catalog is not None:
+            return self._catalog
+        if not self.authenticate():
+            return []
+        if self.anonymous and not self.token:
+            # Some registries issue a service token without credentials but
+            # still refuse /v2/_catalog without it. Ignore refusal: an open
+            # registry serves the catalog without any token.
+            self.token, _ttl = _get_anonymous_token(self.registry_url, self.port)
         try:
             images = fetch_catalog_v2(self.registry_url, self.username, self.password, self.port, self.token)
             if images and "repositories" in images:
-                return sorted(images["repositories"])
-            return []
-        except Exception:
-            return []
+                self._catalog = sorted(images["repositories"])
+            else:
+                self._catalog = []
+        except (Exception, SystemExit):
+            self._catalog = []
+        return self._catalog
 
     def fetch_tags(self, repo_name):
-        if not self.token:
+        if repo_name in self._tags_cache:
+            return self._tags_cache[repo_name]
+        if not self.token and not self.anonymous:
             if not self.authenticate():
                 return []
         try:
-            token2 = getTokenForImageScope(self.registry_url, self.username, self.password, self.port, repo_name)
+            token2 = getTokenForImageScope(self.registry_url, self.username, self.password, self.port, repo_name, anonymous=self.anonymous)
             tags_data = get_tag_image(self.registry_url, self.username, self.password, self.port, token2, repo_name)
-            if tags_data and "tags" in tags_data:
-                return tags_data["tags"]
+            tags = (tags_data.get("tags") or []) if tags_data else []
+        except (Exception, SystemExit):
             return []
-        except Exception:
-            return []
+        self._tags_cache[repo_name] = tags
+        self._tag_counts[repo_name] = len(tags)
+        return tags
 
     def fetch_digest(self, repo_name, tag):
-        if not self.token:
+        key = (repo_name, tag)
+        if key in self._digest_cache:
+            return self._digest_cache[key]
+        if not self.token and not self.anonymous:
             return None
         try:
-            token2 = getTokenForImageScope(self.registry_url, self.username, self.password, self.port, repo_name)
+            token2 = getTokenForImageScope(self.registry_url, self.username, self.password, self.port, repo_name, anonymous=self.anonymous)
             digest = get_manifest_list_image_digest(self.registry_url, self.username, self.password, self.port, token2, repo_name, tag)
-            return digest
-        except Exception:
+        except (Exception, SystemExit):
             return None
+        self._digest_cache[key] = digest
+        return digest
 
     def fetch_image_info(self, repo_name):
+        if repo_name in self._repo_info_cache:
+            return self._repo_info_cache[repo_name]
         if not self.token:
             if not self.authenticate():
                 return None
@@ -3896,9 +4126,10 @@ class QueryLoop:
                 'Authorization': "Bearer " + self.token
             }
             url = f"https://{self.registry_url}:{self.port}/api/v1/repository/{repo_name}"
-            response = requests.get(url, headers=headers, timeout=10)
+            response = self.session.get(url, headers=headers, timeout=10)
             if response.status_code == 200:
-                return response.json()
+                self._repo_info_cache[repo_name] = response.json()
+                return self._repo_info_cache[repo_name]
             return None
         except Exception:
             return None
@@ -3980,6 +4211,7 @@ class QueryLoop:
                     break
 
     def get_search_input(self, stdscr):
+        stdscr.timeout(-1)
         h, w = stdscr.getmaxyx()
         input_str = ""
         cursor_pos = 0
@@ -4052,16 +4284,58 @@ class QueryLoop:
             return None
 
     def fetch_manifest(self, repo_name, digest):
-        if not self.token:
+        key = (repo_name, digest)
+        if key in self._manifest_cache:
+            return self._manifest_cache[key]
+        if not self.token and not self.anonymous:
             return None
         try:
-            token2 = getTokenForImageScope(self.registry_url, self.username, self.password, self.port, repo_name)
+            token2 = getTokenForImageScope(self.registry_url, self.username, self.password, self.port, repo_name, anonymous=self.anonymous)
             manifest = get_manifestlist(self.registry_url, self.username, self.password, self.port, token2, repo_name, digest)
-            if manifest:
-                return json.loads(manifest)
+            parsed = json.loads(manifest) if manifest else None
+        except (Exception, SystemExit):
             return None
+        self._manifest_cache[key] = parsed
+        return parsed
+
+    def request_tag_count(self, repo_name):
+        """Fetch an image's tag count in the background (never blocks the UI)."""
+        if not repo_name or repo_name in self._tag_counts \
+                or repo_name in self._tag_count_pending:
+            return
+        if not self._tag_workers:
+            for _ in range(6):
+                worker = threading.Thread(target=self._tag_count_worker,
+                                          name="qrc-tag-count", daemon=True)
+                worker.start()
+                self._tag_workers.append(worker)
+        self._tag_count_pending.add(repo_name)
+        self._tag_count_queue.put(repo_name)
+
+    def _tag_count_worker(self):
+        while True:
+            repo_name = self._tag_count_queue.get()
+            try:
+                if repo_name is None:
+                    return
+                count = len(self.fetch_tags(repo_name) or [])
+            except (Exception, SystemExit):
+                count = 0
+            finally:
+                self._tag_count_queue.task_done()
+            self._tag_count_pending.discard(repo_name)
+            self._tag_counts[repo_name] = count
+            self._tag_count_updated.set()
+
+    def close(self):
+        # Unblock the daemon workers; they are daemons so exit never waits on
+        # a slow registry.
+        for _ in self._tag_workers:
+            self._tag_count_queue.put(None)
+        try:
+            self.session.close()
         except Exception:
-            return None
+            pass
 
     def build_tree(self):
         repos = self.fetch_catalog()
@@ -4159,26 +4433,6 @@ class QueryLoop:
 
         node.loaded = True
 
-    def expand_to_blobs(self, node):
-        if node.node_type == "image":
-            self.load_node_children(node)
-            for child in node.children:
-                if child.node_type == "tag":
-                    child.expanded = True
-                    self.load_node_children(child)
-        elif node.node_type == "directory":
-            self.load_node_children(node)
-            for child in node.children:
-                if child.node_type in ("directory", "image"):
-                    child.expanded = True
-                    self.expand_to_blobs(child)
-        elif node.node_type == "tag":
-            self.load_node_children(node)
-            for child in node.children:
-                if child.node_type == "manifest":
-                    child.expanded = True
-                    self.load_node_children(child)
-
     def get_visible_nodes(self):
         self.visible_nodes = []
         self._collect_visible(self.root, 0)
@@ -4202,21 +4456,30 @@ class QueryLoop:
         curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK)
         curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
 
-        if not self.username or not self.password:
+        if not self.anonymous and (not self.username or not self.password):
             self.get_credentials(stdscr)
 
         if not self.authenticate():
             self.show_message(stdscr, "Authentication failed. Check credentials.", error=True)
             return
 
+        stdscr.clear()
+        self.show_loading(stdscr, "Loading repository catalog...")
         self.build_tree()
         if not self.root or not self.root.children:
-            self.show_message(stdscr, "No repositories found.", error=True)
+            if self.anonymous:
+                self.show_message(stdscr, "No repositories visible anonymously.", error=True)
+            else:
+                self.show_message(stdscr, "No repositories found.", error=True)
             return
 
-        self.tree_view(stdscr)
+        try:
+            self.tree_view(stdscr)
+        finally:
+            self.close()
 
     def get_credentials(self, stdscr):
+        stdscr.timeout(-1)
         stdscr.clear()
         h, w = stdscr.getmaxyx()
         y = h // 2 - 5
@@ -4235,81 +4498,107 @@ class QueryLoop:
         self.password = password
         stdscr.clear()
 
+    def draw_tree(self, stdscr):
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+
+        mode = " (anonymous)" if self.anonymous else ""
+        title = f"Registry Browser - {self.registry_url}:{self.port}{mode}"
+        stdscr.addstr(0, (w - len(title)) // 2, title, curses.A_BOLD | curses.color_pair(1))
+        stdscr.addstr(1, 0, "=" * (w - 1))
+
+        visible = self.get_visible_nodes()
+        if not visible:
+            stdscr.addstr(3, 2, "No items to display.", curses.color_pair(3))
+        else:
+            visible_rows = h - 4
+            start_idx = max(0, self.selected_idx - visible_rows // 2)
+            end_idx = min(len(visible), start_idx + visible_rows)
+
+            for i in range(start_idx, end_idx):
+                node, depth = visible[i]
+                y = 2 + (i - start_idx)
+                if y >= h - 2:
+                    break
+
+                prefix = "  " * depth
+                icon = "[?]"
+                if node.node_type == "directory":
+                    icon = "[-]" if node.expanded else "[+]"
+                elif node.node_type == "image":
+                    icon = "[I]"
+                    repo = node.data.get("repo", "")
+                    tag_count = self._tag_counts.get(repo)
+                    if tag_count is None:
+                        # Queue the count; rendering never waits for the network.
+                        self.request_tag_count(repo)
+                    elif tag_count > 0:
+                        base_name = node.data.get("display_name", "")
+                        if not base_name:
+                            base_name = node.name.split(" (")[0] if " (" in node.name else node.name
+                            node.data["display_name"] = base_name
+                        if f"({tag_count} tags)" not in node.name:
+                            node.name = f"{base_name} ({tag_count} tags)"
+                elif node.node_type == "tag":
+                    icon = "[T]"
+                elif node.node_type == "blob":
+                    icon = "[B]"
+                elif node.node_type == "manifest":
+                    icon = "[M]"
+                elif node.node_type == "registry":
+                    icon = "[R]"
+                    port = node.data.get("port", self.port)
+                    node.name = f"{self.registry_url}:{port}"
+
+                display = f"{prefix}{icon} {node.name}"
+                is_match = i in self.search_matches
+                if i == self.selected_idx:
+                    stdscr.addstr(y, 2, display[:w-3], curses.A_REVERSE | curses.A_BOLD)
+                elif is_match:
+                    color = curses.color_pair(2)
+                    stdscr.addstr(y, 2, display[:w-3], color | curses.A_BOLD)
+                else:
+                    color = curses.color_pair(1) if node.node_type == "directory" else \
+                            curses.color_pair(2) if node.node_type == "image" else \
+                            curses.color_pair(4) if node.node_type == "tag" else \
+                            curses.color_pair(5) if node.node_type == "manifest" else \
+                            curses.color_pair(3) if node.node_type == "blob" else \
+                            curses.color_pair(3)
+                    stdscr.addstr(y, 2, display[:w-3], color)
+
+        match_info = f" [{self.current_match + 1}/{len(self.search_matches)}]" if self.search_matches else ""
+        status = f"[/] Search | [n/N] Next/Prev | [Space] Expand | [Enter] Details | [q] Quit{match_info}"
+        stdscr.addstr(h - 1, 0, status[:w - 1])
+        return visible
+
+    def show_loading(self, stdscr, message):
+        """Show a one-line progress message while a blocking fetch runs."""
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(h - 2, 0, " " * (w - 1))
+            stdscr.addstr(h - 2, 0, message[:w - 1], curses.color_pair(4))
+            stdscr.refresh()
+        except curses.error:
+            pass
+
     def tree_view(self, stdscr):
+        visible = []
+        dirty = True
         while True:
-            stdscr.clear()
-            h, w = stdscr.getmaxyx()
-
-            title = f"Registry Browser - {self.registry_url}:{self.port} (Port: {self.port})"
-            stdscr.addstr(0, (w - len(title)) // 2, title, curses.A_BOLD | curses.color_pair(1))
-            stdscr.addstr(1, 0, "=" * (w - 1))
-
-            visible = self.get_visible_nodes()
-            if not visible:
-                stdscr.addstr(3, 2, "No items to display.", curses.color_pair(3))
-            else:
-                visible_rows = h - 4
-                start_idx = max(0, self.selected_idx - visible_rows // 2)
-                end_idx = min(len(visible), start_idx + visible_rows)
-
-                for i in range(start_idx, end_idx):
-                    node, depth = visible[i]
-                    y = 2 + (i - start_idx)
-                    if y >= h - 2:
-                        break
-
-                    prefix = "  " * depth
-                    icon = "[?]"
-                    if node.node_type == "directory":
-                        icon = "[-]" if node.expanded else "[+]"
-                    elif node.node_type == "image":
-                        icon = "[I]"
-                        if not hasattr(node, '_tag_count_fetched'):
-                            repo = node.data.get("repo", "")
-                            if repo and self.token:
-                                tags = self.fetch_tags(repo)
-                                node._tag_count = len(tags) if tags else 0
-                                node._tag_count_fetched = True
-                        tag_count = getattr(node, '_tag_count', 0)
-                        if tag_count > 0:
-                            base_name = node.data.get("display_name", "")
-                            if not base_name:
-                                base_name = node.name.split(" (")[0] if " (" in node.name else node.name
-                                node.data["display_name"] = base_name
-                            if f"({tag_count} tags)" not in node.name:
-                                node.name = f"{base_name} ({tag_count} tags)"
-                    elif node.node_type == "tag":
-                        icon = "[T]"
-                    elif node.node_type == "blob":
-                        icon = "[B]"
-                    elif node.node_type == "manifest":
-                        icon = "[M]"
-                    elif node.node_type == "registry":
-                        icon = "[R]"
-                        port = node.data.get("port", self.port)
-                        node.name = f"{self.registry_url}:{port}"
-
-                    display = f"{prefix}{icon} {node.name}"
-                    is_match = i in self.search_matches
-                    if i == self.selected_idx:
-                        stdscr.addstr(y, 2, display[:w-3], curses.A_REVERSE | curses.A_BOLD)
-                    elif is_match:
-                        color = curses.color_pair(2)
-                        stdscr.addstr(y, 2, display[:w-3], color | curses.A_BOLD)
-                    else:
-                        color = curses.color_pair(1) if node.node_type == "directory" else \
-                                curses.color_pair(2) if node.node_type == "image" else \
-                                curses.color_pair(4) if node.node_type == "tag" else \
-                                curses.color_pair(5) if node.node_type == "manifest" else \
-                                curses.color_pair(3) if node.node_type == "blob" else \
-                                curses.color_pair(3)
-                        stdscr.addstr(y, 2, display[:w-3], color)
-
-            match_info = f" [{self.current_match + 1}/{len(self.search_matches)}]" if self.search_matches else ""
-            status = f"[/] Search | [n/N] Next/Prev | [Space] Expand | [Enter] Details | [q] Quit{match_info}"
-            stdscr.addstr(h - 1, 0, status[:w - 1])
+            # Wake up regularly to collect tag counts fetched in the background.
+            stdscr.timeout(200)
+            if dirty:
+                visible = self.draw_tree(stdscr)
+                dirty = False
 
             key = stdscr.getch()
+            if key == -1:
+                if self._tag_count_updated.is_set():
+                    self._tag_count_updated.clear()
+                    dirty = True
+                continue
+            self._tag_count_updated.clear()
+            dirty = True
 
             if key == ord('/'):
                 term = self.get_search_input(stdscr)
@@ -4348,17 +4637,14 @@ class QueryLoop:
                     old_expanded = node.expanded
                     if node.node_type == "directory":
                         node.expanded = not node.expanded
-                    elif node.node_type == "image":
+                    elif node.node_type in ("image", "tag", "manifest"):
                         node.expanded = not node.expanded
                         if node.expanded and not old_expanded:
-                            self.expand_to_blobs(node)
-                    elif node.node_type == "tag":
-                        node.expanded = not node.expanded
-                        if node.expanded and not old_expanded:
-                            self.load_node_children(node)
-                    elif node.node_type == "manifest":
-                        node.expanded = not node.expanded
-                        if node.expanded and not old_expanded:
+                            # Lazy, one level at a time: expanding an image lists
+                            # its tags, a tag lists its manifests, a manifest
+                            # lists its blobs. The old eager walk loaded every
+                            # tag + manifest + blob at once and froze the UI.
+                            self.show_loading(stdscr, "Loading %s..." % node.name)
                             self.load_node_children(node)
                     if not old_expanded:
                         new_visible = self.get_visible_nodes()
@@ -4373,6 +4659,7 @@ class QueryLoop:
                         self.show_node_details(stdscr, node)
 
     def show_node_details(self, stdscr, node):
+        stdscr.timeout(-1)
         while True:
             stdscr.clear()
             h, w = stdscr.getmaxyx()
@@ -4412,6 +4699,7 @@ class QueryLoop:
                 break
 
     def show_message(self, stdscr, message, error=False):
+        stdscr.timeout(-1)
         stdscr.clear()
         h, w = stdscr.getmaxyx()
         y = h // 2
@@ -4428,7 +4716,10 @@ def main():
         display_help()
         sys.exit(0)
 
-    args, unknown = parser.parse_known_args()
+    # parse_args (not parse_known_args): an unknown option or a bare word such
+    # as "q=http" must be an error, not a silently ignored argument that turns
+    # a search into "dump the whole catalog".
+    args = parser.parse_args()
 
     if args.help:
         display_help()
@@ -4454,6 +4745,11 @@ def main():
     only_problems = getattr(args, 'only_problems', False)
     max_repos = getattr(args, 'max_repos', 0)
     cmd_early = args.command
+    anonymous = getattr(args, 'anonymous', False)
+
+    if anonymous and (args.username or args.password or args.token):
+        printstderr("** --anonymous cannot be combined with -u/-p/-T")
+        sys.exit(2)
 
     # fork: read-only hard lock (never mutate the registry)
     if READ_ONLY and cmd_early in DESTRUCTIVE_COMMANDS:
@@ -4498,7 +4794,7 @@ def main():
     # Find the credentials in ~/.docker/config.json (or podman's auth.json).
     # FIX: was matching only "<host>:443" -> silently no creds -> 401 / empty.
     global RAW_BASIC, CREDS_FROM_STORE
-    if registry_url is not None and username is None and password is None and token is None:
+    if registry_url is not None and username is None and password is None and token is None and not anonymous:
         # FIX: strip a trailing '/' so the key matches the stored bare hostname
         # (`podman search host/` works, the old "<host>/" lookup never did).
         clean_url = registry_url.strip().rstrip("/")
@@ -4770,13 +5066,23 @@ def main():
     elif cmd == "search-v1":
         if not all([registry_url, Port]):
             print("Error: search-v1 needs -r"); sys.exit(2)
-        cmd_search_v1(registry_url, Port, getattr(args, 'query', '') or imageName,
-                      username, password, token,
-                      pages_wanted=getattr(args, 'pages', 0),
-                      show_desc=getattr(args, 'desc', False))
+        if cmd_search_v1(registry_url, Port, getattr(args, 'query', '') or imageName,
+                         username, password, token,
+                         pages_wanted=getattr(args, 'pages', 0),
+                         show_desc=getattr(args, 'desc', False)) is None:
+            sys.exit(1)
+    elif cmd == "search-v2":
+        if not all([registry_url, Port]):
+            print("Error: search-v2 needs -r"); sys.exit(2)
+        if cmd_search_v2(registry_url, Port, getattr(args, 'query', '') or imageName,
+                         username, password, token,
+                         anonymous=anonymous,
+                         max_pages=getattr(args, 'pages', 0)) is None:
+            sys.exit(1)
     elif cmd == "interactive":
         from curses import wrapper
-        loop = QueryLoop(registry_url, Port, username, password, debug)
+        loop = QueryLoop(registry_url, Port, username, password, debug,
+                         anonymous=anonymous)
         wrapper(loop.run)
     else:
         print("A command is needed.")

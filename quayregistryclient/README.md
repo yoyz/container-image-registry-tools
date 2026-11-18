@@ -9,7 +9,7 @@ nothing about *why*: which repositories actually exist, which ones are mirrors, 
 each mirror is synchronised against, which robot account it uses, and what a
 synchronisation error means once Quay has decrypted it.
 
-Current version: **0.5.0**.
+Current version: **0.5.1**.
 
 ## Features
 
@@ -68,6 +68,7 @@ leaf certificate instead of the full chain (and says so on stderr).
 | `-o`, `--org` | Organisation name (`mirror-scan`, `org-robots`, `gc-audit --all-repos`). |
 | `--all-repos` | `gc-audit`: audit every repository of `-o ORG`. |
 | `-q`, `--query` | Search term for `search-v1`. |
+| `-A`, `--anonymous` | `interactive` / `search-v2`: browse or search without credentials, when the registry allows anonymous `/v2` access. |
 | `-d`, `--debug` | Debug mode: equivalent `curl` commands and diagnostics on stderr. |
 | `--show-secrets` | Do not mask secret-bearing fields in API responses. |
 | `--orgs a,b,c` | Candidate organisations for `org-exists`. |
@@ -114,7 +115,8 @@ turned off.
 | `get-blob` | blob layer | `-r -i -D` | read |
 | `get-server-certificate` | TLS handshake | `-r` | read |
 | `search-v1` | registry V1 search (what `podman search` calls) | `-r` | read |
-| `interactive` | `/v2`, ncurses tree browser | `-r` | read |
+| `search-v2` | `/v2/_catalog` pagination + local name filter (podman's V2 fallback) | `-r` (or `-r -A`) | read |
+| `interactive` | `/v2`, ncurses tree browser | `-r` (or `-r -A` for anonymous access) | read |
 | `quay-config` | public `/config` | `-r` | read — anonymous, no credential needed |
 | `org-exists` | anonymous per-org probe | `-r --orgs a,b,c` | read — anonymous; answers 200 = org exists, 404 = absent |
 | `whoami` | `/api/v1/user/` | `-r` + API credential | read |
@@ -161,7 +163,7 @@ Two notes on this table:
 > to the Prometheus counter `quay_gc_storage_blobs_deleted`, which has no repository
 > label. A missing blob on an active tag is therefore a finding, not proof of a Quay
 > GC bug — check S3/GCS lifecycle rules and storage-side deletion too. See
-> [`doc/garbage_collection.md`](../doc/garbage_collection.md) for the full model
+> [`doc/garbage_collection.md`](doc/garbage_collection.md) for the full model
 > (time machine, auto-prune, manifest/blob deletion, API limits and `gc-audit`).
 
 ### Quirks this tool encodes
@@ -182,6 +184,17 @@ nothing" reports:
   first and stop with exit code 5 instead of printing a believable `0`.
 * **`podman search` works on a registry whose `/v2/_catalog` you cannot read.** V1 search
   authenticates through the token grant; `search-v1` covers that case.
+* **Docker Hub does not implement V1 search.** `docker.io/v1/search` redirects to an HTML
+  page on `www.docker.com`; `search-v1` refuses cross-host redirects and exits 1 with an
+  explicit message instead of crashing. Use `docker search` or the Docker Hub search API
+  for Hub content. Docker Hub also does not expose a public `/v2/_catalog`, so
+  `interactive -A` has nothing to browse there.
+* **V2 has no search endpoint either.** `search-v2` implements what podman falls back to:
+  page through `/v2/_catalog` (following `Link` headers), then substring-match repository
+  names locally. The catalog carries no descriptions, so the table only has a `NAME`
+  column; `--pages N` caps the crawl. `-A` works on registries whose catalog is public
+  (e.g. `registry.fedoraproject.org`), not on Quay or Docker Hub. Details and limits:
+  [`doc/command/search-v2.md`](doc/command/search-v2.md).
 * **API errors carry no plaintext secrets.** Quay returns upstream mirror credentials
   already decrypted; that decryption happens server-side. The tool masks them
   (`--show-secrets` reveals them).
@@ -376,6 +389,7 @@ Manifest → Blob.
 
 ```bash
 ./quayregistryclient interactive -r registry.example.com [-P 443] [-u user] [-p pass]
+./quayregistryclient interactive -r registry.example.com -A    # anonymous, if allowed
 ```
 
 | Key | Action |
@@ -387,6 +401,22 @@ Manifest → Blob.
 | `/` | Search for an image name |
 | `n` / `N` | Next / previous match |
 | `q` | Quit |
+
+Expansion is lazy: `Space` on an image lists its tags, on a tag lists its manifests,
+on a manifest lists its blobs. Network access is kept off the critical path — the
+catalog, tags, digests and manifests are cached for the session, HTTP connections and
+repository-scope tokens are reused, and tag counts are fetched in the background so
+navigation stays responsive on large registries.
+
+`-A`/`--anonymous` browses without credentials and sends no `Authorization` header
+(anonymous token grant, then unauthenticated fallback). It only shows what the registry
+exposes anonymously: an open registry or a public catalog. Docker Hub and most Quay
+installations restrict `/v2/_catalog`, so `-A` reports `No repositories visible
+anonymously.` there; use credentials instead.
+
+The full reference — authentication, registry requests, tree model, keys, caching,
+limits and troubleshooting — is in
+[`doc/command/interactive.md`](doc/command/interactive.md).
 
 ## Bash completion
 
@@ -423,6 +453,11 @@ the environment (`QRC_TOKEN`, …) rather than the command line, so they never a
 ./quayregistryclient search-v1 -r registry.example.com -q ubi
 ./quayregistryclient search-v1 -r registry.example.com -q postgres --pages 2 --desc
 
+# V2 catalog search (podman's fallback): page /v2/_catalog, filter names locally.
+# `-A` works on registries that expose their catalog anonymously (e.g. Fedora).
+./quayregistryclient search-v2 -r registry.fedoraproject.org -A -q http
+./quayregistryclient search-v2 -r registry.example.com -q myapp --pages 3
+
 # 2. Walk an organisation through the API
 ./quayregistryclient list-organizations -r registry.example.com
 ./quayregistryclient list-organizations -r registry.example.com --all   # superuser
@@ -448,7 +483,7 @@ auto-prune (GC retention) policies of the repository and of its organisation.
 ### GC / blob audit
 
 `gc-audit` is the read-only diagnostic for “a tag exists but its layers are gone”
-(see also [`doc/garbage_collection.md`](../doc/garbage_collection.md)):
+(see also [`doc/garbage_collection.md`](doc/garbage_collection.md)):
 
 ```bash
 # Metadata + full blob presence check (HEAD /v2/.../blobs/<digest>)
