@@ -65,15 +65,17 @@ leaf certificate instead of the full chain (and says so on stderr).
 | `-D`, `--digest` | Image digest (`sha256:…`). |
 | `-a`, `--apipath` | API path, for the raw `browse-api` / `set-api-key-value` commands. |
 | `-K`, `--key` / `-V`, `--value` | Key and value for `set-api-key-value`. |
-| `-o`, `--org` | Organisation name. |
+| `-o`, `--org` | Organisation name (`mirror-scan`, `org-robots`, `gc-audit --all-repos`). |
+| `--all-repos` | `gc-audit`: audit every repository of `-o ORG`. |
 | `-q`, `--query` | Search term for `search-v1`. |
 | `-d`, `--debug` | Debug mode: equivalent `curl` commands and diagnostics on stderr. |
 | `--show-secrets` | Do not mask secret-bearing fields in API responses. |
 | `--orgs a,b,c` | Candidate organisations for `org-exists`. |
 | `--pages N` | Page limit for `search-v1`. |
 | `--desc` | `search-v1`: also show repository descriptions. |
-| `--only-problems` | `mirror-scan`: keep only repositories whose mirror is unhealthy. |
+| `--only-problems` | `mirror-scan`: unhealthy mirrors; `gc-audit`: repositories/tags/blobs needing attention (text output). |
 | `--max-repos N` / `--offset N` | `mirror-scan`: window over an organisation. |
+| `--persist-connection` / `--no-persist-connection` | `gc-audit`: reuse HTTP connections per thread (enabled by default; `--no-…` creates a session per request). |
 | `--i-am-deleting-all-repo` | Required confirmation for `delete-all-repo`. |
 | `-h`, `--help` | Show the help; also works per command (`mirror-scan -h`). |
 | `--generate-completion` | Print a bash completion script and exit. |
@@ -116,15 +118,16 @@ turned off.
 | `quay-config` | public `/config` | `-r` | read — anonymous, no credential needed |
 | `org-exists` | anonymous per-org probe | `-r --orgs a,b,c` | read — anonymous; answers 200 = org exists, 404 = absent |
 | `whoami` | `/api/v1/user/` | `-r` + API credential | read |
+| `list-organizations` | `/api/v1/user/` (current user) or `/api/v1/superuser/organizations/` (`--all`) | `-r` + API credential; `--all` needs superuser | read |
 | `list-org-repos` | `/api/v1/…/repository` | `-r -o` + API credential | read |
 | `org-robots` | `/api/v1/…/robots` | `-r -o` + API credential | read |
 | `repo-view` | `/api/v1/repository/<org>/<name>` | `-r -i` + API credential | read |
 | `mirror-get` | repository + mirror config + **auto-prune (GC) policies** | `-r -i` + API credential | read |
 | `mirror-scan` | per-repo mirror inventory, with `HEALTH` / `PERIMETRE` / `ROBOTS` aggregates | `-r -o` + API credential | read |
-| `gc-audit` | tags pending GC, auto-prune policies, blob presence via `/v2` `HEAD`, sparse children | `-r -i` + API credential (registry pull credential for blob checks) | read |
+| `gc-audit` | tags pending GC, auto-prune policies, blob presence via `/v2` `HEAD`, sparse children — one repo or all repos of an org | `-r -i` or `-r -o ORG --all-repos` + API credential (registry pull credential for blob checks) | read |
 | `browse-api` | any `/api/v1` path, `GET` | `-r -T -a` | read |
 | `quay-api-discovery` | `/api/v1/discovery` | `-r -T` | read |
-| `quay-api-listuser` | `/api/v1/superuser/users/` | `-r -T` | read |
+| `quay-api-listuser` | `/api/v1/superuser/users/` | `-r` + superuser API credential (`-T` recommended; fresh web session may work) | read |
 | `delete-repo` | `DELETE` repository | `-r -i -T` | **read/write — disabled** |
 | `delete-tag` | `DELETE` tag | `-r -i -t -T` | **read/write — disabled** |
 | `delete-all-repo` | `DELETE` every repository of an org, after a 10 s countdown | `-r -u -p -T --i-am-deleting-all-repo` | **read/write — disabled** |
@@ -218,6 +221,9 @@ logged, or written back.
 
 ### /api/v1 authentication
 
+> `quayregistryclient --help` only lists commands and options. This section is
+> the reference for the authentication flow, examples and warnings.
+
 Quay's JSON API does **not** accept HTTP Basic: it answers
 `401 {"error_type": "invalid_token"}` even for a credential the very same registry
 accepts on `/v2`. Three modes are supported, tried in this order:
@@ -237,6 +243,13 @@ succeeds where a Basic-auth call 401s.
 
 The OAuth/app token of a Quay application (or a robot token) — the same value an
 Ansible playbook passes as `quay_api_token`.
+
+Superuser endpoints such as `/api/v1/superuser/users/` also require a
+**superuser** and a **fresh login** (`@require_fresh_login`, 10 min by default).
+`-T` with a superuser OAuth token is the recommended path. A `QRC_COOKIE` or a
+web-login session can also work when the session belongs to a superuser and is
+still fresh; otherwise Quay answers with a fresh-login error. `quay-api-listuser`
+accepts all three credential modes, but `-T` remains the most reliable.
 
 #### 2. Session cookie — `QRC_COOKIE`
 
@@ -406,7 +419,13 @@ the environment (`QRC_TOKEN`, …) rather than the command line, so they never a
 ./quayregistryclient whoami       -r registry.example.com
 ./quayregistryclient list-catalog -r registry.example.com
 
+# Registry V1 search (what `podman search` uses)
+./quayregistryclient search-v1 -r registry.example.com -q ubi
+./quayregistryclient search-v1 -r registry.example.com -q postgres --pages 2 --desc
+
 # 2. Walk an organisation through the API
+./quayregistryclient list-organizations -r registry.example.com
+./quayregistryclient list-organizations -r registry.example.com --all   # superuser
 ./quayregistryclient list-org-repos -r registry.example.com -o myorg
 ./quayregistryclient org-robots     -r registry.example.com -o myorg
 
@@ -445,7 +464,24 @@ auto-prune (GC retention) policies of the repository and of its organisation.
 
 # Machine-readable output
 ./quayregistryclient gc-audit -r registry.example.com -i myorg/app --json
+
+# Every repository of an organisation, with a per-repo and a global summary
+./quayregistryclient gc-audit -r registry.example.com -o myorg --all-repos \
+    --only-problems --fail-on-problem --repo-jobs 4 --jobs 8
 ```
+
+With `--all-repos`, `gc-audit` enumerates the organisation through
+`/api/v1/repository?namespace=...`, runs the same read-only audit per repository,
+and prints one summary line per repo plus global totals. Repository audits run
+in parallel with `--repo-jobs N` (default `4`); each repository still uses
+`--jobs N` (default `8`) parallel blob `HEAD` requests. `--json` then emits an
+aggregate document (`org`, `repositories[]`, `totals`, `errors`, `verdict`), not
+the full per-blob detail. Global blob/byte totals are sums of per-repository
+uniques: a blob shared by two repositories is counted twice. Use a single-repo
+`--json` audit when you need `blobs.items`. HTTP connections are reused per
+thread by default (`--persist-connection`); use `--no-persist-connection` to
+create a fresh session per request. Reduce `--repo-jobs` / `--jobs` if the
+registry rate-limits or the storage backend saturates.
 
 It prints:
 
@@ -467,8 +503,10 @@ It is acquired from `-u/-p`, the stored podman/docker credential, or an anonymou
 token grant for a public repository; without it the command still reports the
 metadata and marks the blobs `unchecked` (verdict `INCOMPLETE`, not `OK`).
 
-Options: `--json`, `--only-problems` (text output only; JSON stays complete),
-`--no-blob-check`, `--max-tags N` (default 200, `0` = all), `--logs-days N`
-(default `0`), `--jobs N` (default 8), `--fail-on-problem`, `--show-tags`. Exit
-codes: `0` no failure, `1` findings with `--fail-on-problem`, `2` fatal API/usage
+Options: `-o ORG --all-repos`, `--json`, `--only-problems` (text output only;
+JSON stays complete), `--no-blob-check`, `--max-tags N` (default 200, `0` = all),
+`--logs-days N` (default `0`), `--jobs N` (default 8), `--repo-jobs N`
+(default 4 for `--all-repos`), `--persist-connection` (default) /
+`--no-persist-connection`, `--fail-on-problem`, `--show-tags`. Exit codes:
+`0` no failure, `1` findings with `--fail-on-problem`, `2` fatal API/usage
 error.

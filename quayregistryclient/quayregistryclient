@@ -6,7 +6,7 @@
 from urllib.parse import urlencode, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-import requests, json, argparse, sys, re, signal,ssl, socket, os, base64, curses, time
+import requests, json, argparse, sys, re, signal,ssl, socket, os, base64, curses, time, threading
 
 EXIT_TAG_NOT_FOUND=3
 EXIT_ABORTED=130
@@ -706,6 +706,8 @@ SECRET_KEY_RX = re.compile(r'(password|secret|token|credential|api_key|apikey)',
 CRED_FIELDS = {"external_registry_username"}
 
 SHOW_SECRETS = False
+PERSIST_CONNECTION = True  # reuse one requests.Session per thread (keep-alive/TLS)
+_HTTP_THREAD_LOCAL = threading.local()
 
 # gc-audit: audit-log kinds that explain a tag disappearing.  Blob deletions
 # themselves are NOT audited by Quay (only stdout + the Prometheus counter).
@@ -798,6 +800,17 @@ def basic_header(username, password):
 
 
 
+def _http_session():
+    """Return a thread-local requests.Session, or a fresh one when disabled."""
+    if not PERSIST_CONNECTION:
+        return requests.Session()
+    session = getattr(_HTTP_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        _HTTP_THREAD_LOCAL.session = session
+    return session
+
+
 def api_get(registry_url, Port, apipath, username=None, password=None,
             token=None, params=None, timeout=30, max_redirects=5, public=False):
     """
@@ -830,11 +843,20 @@ def api_get(registry_url, Port, apipath, username=None, password=None,
         if CSRF:
             hdrs['X-CSRF-Token'] = CSRF
     else:
-        sess = requests.Session()
+        sess = _http_session()
     r = None
     for _ in range(max_redirects):
-        r = sess.get(url, headers=hdrs, params=params, timeout=timeout,
-                     allow_redirects=False)
+        # requests.Session is not documented as thread-safe, and gc-audit
+        # --all-repos can audit several repositories concurrently when using
+        # the web-login session.  Serialize only the shared-session request;
+        # token/cookie/anonymous modes use a per-call Session and stay parallel.
+        if sess is SESSION:
+            with SESSION_LOCK:
+                r = sess.get(url, headers=hdrs, params=params, timeout=timeout,
+                             allow_redirects=False)
+        else:
+            r = sess.get(url, headers=hdrs, params=params, timeout=timeout,
+                         allow_redirects=False)
         if r.status_code in (301, 302, 303, 307, 308):
             loc = r.headers.get("Location", "")
             if not loc:
@@ -1203,7 +1225,8 @@ def _gc_v2_token_for_repo(registry_url, Port, imageName, username=None,
         if username:
             params["account"] = username
         try:
-            r = requests.get(auth_url, headers=headers, params=params, timeout=20)
+            r = _http_session().get(auth_url, headers=headers, params=params,
+                                    timeout=20)
         except requests.exceptions.RequestException as exc:
             last_error = "%s: %s" % (mode, exc)
             continue
@@ -1230,7 +1253,8 @@ def _gc_v2_get_manifest(registry_url, Port, imageName, digest, v2token):
     headers = {"Accept": GC_AUDIT_MANIFEST_ACCEPT,
                "Authorization": "Bearer " + v2token}
     try:
-        r = requests.get(url, headers=headers, timeout=40, allow_redirects=True)
+        r = _http_session().get(url, headers=headers, timeout=40,
+                                allow_redirects=True)
     except requests.exceptions.RequestException as exc:
         return None, "request failed: %s" % exc
     if r.status_code == 200:
@@ -1247,7 +1271,8 @@ def _gc_head_blob(registry_url, Port, imageName, digest, v2token):
            + "/blobs/" + quote(digest, safe=':'))
     headers = {"Authorization": "Bearer " + v2token}
     try:
-        r = requests.head(url, headers=headers, timeout=40, allow_redirects=True)
+        r = _http_session().head(url, headers=headers, timeout=40,
+                                 allow_redirects=True)
     except requests.exceptions.RequestException as exc:
         return {"status": "unchecked", "size": None, "detail": "request failed: %s" % exc}
 
@@ -1264,8 +1289,8 @@ def _gc_head_blob(registry_url, Port, imageName, digest, v2token):
     # Some proxies dislike HEAD: fall back to a one-byte ranged GET.
     if r.status_code in (405, 501):
         try:
-            g = requests.get(url, headers=dict(headers, Range="bytes=0-0"),
-                             timeout=40, allow_redirects=True, stream=True)
+            g = _http_session().get(url, headers=dict(headers, Range="bytes=0-0"),
+                                    timeout=40, allow_redirects=True, stream=True)
         except requests.exceptions.RequestException as exc:
             return {"status": "unchecked", "size": None,
                     "detail": "HEAD %d; GET failed: %s" % (r.status_code, exc)}
@@ -1635,19 +1660,24 @@ def _gc_print_text(result, only_problems=False, show_tags=False):
     for tag_item in tags["items"]:
         groups.setdefault(tag_item["name"] or "?", []).append(tag_item)
 
-    shown = 0
+    # First pass: decide which tag names are displayed, so the name column can
+    # be padded to the longest *displayed* tag instead of a fixed width.
+    displayed = []
     for name, rows in groups.items():
         active_rows = [item for item in rows if item["active"]]
         eligible_rows = [item for item in rows if item["gc_eligible"]]
         pending_rows = [
             item for item in rows
             if (not item["active"]) and (not item["gc_eligible"])]
-        eligible_count = len(eligible_rows)
-        pending_count = len(pending_rows)
-
-        if only_problems and active_rows and not (eligible_count or pending_count):
+        if only_problems and active_rows and not (eligible_rows or pending_rows):
             if not show_tags:
                 continue
+        displayed.append((name, rows, active_rows, eligible_rows, pending_rows))
+
+    name_width = max([len(name) for name, _rows, _a, _e, _p in displayed] or [1])
+    for name, rows, active_rows, eligible_rows, pending_rows in displayed:
+        eligible_count = len(eligible_rows)
+        pending_count = len(pending_rows)
 
         if active_rows:
             state = "active"
@@ -1681,12 +1711,14 @@ def _gc_print_text(result, only_problems=False, show_tags=False):
                 current.get("present_child_count"),
                 current.get("child_manifest_count"))
 
-        print("  %-30s %-11s digest=%s size=%s%s"
-              % (name, state, current["digest"],
-                 _gc_fmt_bytes(current["size"]), suffix))
-        shown += 1
+        size_field = _gc_fmt_bytes(current["size"])
+        if suffix:
+            size_field = "%-10s" % size_field
+        print("  %-*s %-11s digest=%s size=%s%s"
+              % (name_width, name, state, current["digest"],
+                 size_field, suffix))
 
-    if only_problems and shown == 0:
+    if only_problems and not displayed:
         print("  (no expired, pending-GC or historical tag version)")
 
     blobs = result["blobs"]
@@ -1770,7 +1802,8 @@ def _gc_print_text(result, only_problems=False, show_tags=False):
 def cmd_gc_audit(registry_url, Port, imageName, username=None, password=None,
                  token=None, json_output=False, only_problems=False,
                  blob_check=True, max_tags=200, logs_days=0, jobs=8,
-                 fail_on_problem=False, show_tags=False):
+                 fail_on_problem=False, show_tags=False, emit=True,
+                 return_result=False):
     """
     Read-only GC / blob audit for ONE repository.
 
@@ -1782,11 +1815,18 @@ def cmd_gc_audit(registry_url, Port, imageName, username=None, password=None,
       * every blob referenced by those tags, checked with HEAD /v2/.../blobs/...;
       * sparse manifest-list children and manifest metadata errors;
       * optionally, recent tag-deletion audit entries.
+
+    With emit=False the function returns (exit_code, result) when
+    return_result=True, so the org-wide batch mode can aggregate repositories
+    without re-parsing its own text/JSON output.
     """
+    def _ret(code, result=None):
+        return (code, result) if return_result else code
+
     imageName = imageName.strip("/")
     if "/" not in imageName:
         printstderr("** gc-audit needs -i <namespace/repository> (got %r)" % imageName)
-        return 2
+        return _ret(2)
     try:
         max_tags = max(0, int(max_tags))
     except (TypeError, ValueError):
@@ -1803,12 +1843,12 @@ def cmd_gc_audit(registry_url, Port, imageName, username=None, password=None,
     if r.status_code != 200:
         printstderr("** gc-audit: cannot read repository %s (HTTP %d): %s"
                     % (imageName, r.status_code, (r.text or "")[:200]))
-        return 2
+        return _ret(2)
     try:
         repo_data = r.json()
     except ValueError:
         printstderr("** gc-audit: repository API returned invalid JSON")
-        return 2
+        return _ret(2)
 
     state = repo_data.get("state")
     tag_expiration_s = repo_data.get("tag_expiration_s")
@@ -1845,12 +1885,12 @@ def cmd_gc_audit(registry_url, Port, imageName, username=None, password=None,
         if rr.status_code != 200:
             printstderr("** gc-audit: cannot list tags (HTTP %d): %s"
                         % (rr.status_code, (rr.text or "")[:200]))
-            return 2
+            return _ret(2)
         try:
             data = rr.json()
         except ValueError:
             printstderr("** gc-audit: tag API returned invalid JSON")
-            return 2
+            return _ret(2)
         chunk = data.get("tags") or []
         for tag in chunk:
             if max_tags and len(tags) >= max_tags:
@@ -2117,14 +2157,316 @@ def cmd_gc_audit(registry_url, Port, imageName, username=None, password=None,
         "verdict": verdict,
     }
 
-    if json_output:
-        print(json.dumps(result, indent=2, sort_keys=False))
-    else:
-        _gc_print_text(result, only_problems=only_problems,
-                       show_tags=show_tags)
+    if emit:
+        if json_output:
+            print(json.dumps(result, indent=2, sort_keys=False))
+        else:
+            _gc_print_text(result, only_problems=only_problems,
+                           show_tags=show_tags)
 
-    if fail_on_problem and problems:
+    code = 1 if (fail_on_problem and problems) else 0
+    return _ret(code, result)
+
+
+def cmd_gc_audit_all(registry_url, Port, org, username=None, password=None,
+                     token=None, json_output=False, only_problems=False,
+                     blob_check=True, max_tags=200, logs_days=0, jobs=8,
+                     fail_on_problem=False, show_tags=False, repo_jobs=4):
+    """
+    Org-wide gc-audit: enumerate every repository of -o ORG and run the same
+    read-only audit on each one, then print a per-repository summary and totals.
+    """
+    repos, _pages, truncated = quay_list_org_repos(
+        registry_url, Port, org, username, password, token)
+    if not repos:
+        if truncated:
+            printstderr("** gc-audit --all-repos: could not enumerate repositories "
+                        "of %s" % org)
+            return 2
+        printstderr("# gc-audit --all-repos: no repository found in %s" % org)
+        return 0
+
+    repos = sorted(set(repos))
+    summaries = []
+    errors = []
+    totals = {
+        "repositories": len(repos),
+        "tags_rows": 0,
+        "tags_unique_names": 0,
+        "tags_active_names": 0,
+        "tags_gc_eligible_rows": 0,
+        "tags_pending_rows": 0,
+        "tags_expired_rows": 0,
+        "blobs_unique": 0,
+        "blobs_present": 0,
+        "blobs_missing": 0,
+        "blobs_size_mismatch": 0,
+        "blobs_unchecked": 0,
+        "blobs_skipped": 0,
+        "bytes_referenced": 0,
+    }
+
+    repo_jobs = max(1, int(repo_jobs))
+    outcomes = {}
+
+    def _run_one(repo, index):
+        if repo_jobs <= 1:
+            printstderr("# gc-audit [%d/%d] %s" % (index, len(repos), repo))
+        code, audited = cmd_gc_audit(
+            registry_url, Port, repo, username, password, token,
+            json_output=False, only_problems=False, blob_check=blob_check,
+            max_tags=max_tags, logs_days=logs_days, jobs=jobs,
+            fail_on_problem=False, show_tags=False, emit=False,
+            return_result=True,
+        )
+        return {"code": code, "result": audited, "exception": None}
+
+    if repo_jobs <= 1:
+        for index, repo in enumerate(repos, 1):
+            try:
+                outcomes[repo] = _run_one(repo, index)
+            except Exception as exc:  # noqa: BLE001 - one repo must not stop the batch
+                outcomes[repo] = {
+                    "code": 2, "result": None,
+                    "exception": "repository audit crashed: %s" % exc,
+                }
+    else:
+        with ThreadPoolExecutor(max_workers=repo_jobs) as pool:
+            futures = {
+                pool.submit(_run_one, repo, 0): repo
+                for repo in repos
+            }
+            done = 0
+            for future in as_completed(futures):
+                repo = futures[future]
+                done += 1
+                try:
+                    outcomes[repo] = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    outcomes[repo] = {
+                        "code": 2, "result": None,
+                        "exception": "repository audit crashed: %s" % exc,
+                    }
+                printstderr("# gc-audit [%d/%d] done %s" % (done, len(repos), repo))
+
+    # Process results in sorted repository order, even though the worker
+    # completions are unordered.
+    for repo in repos:
+        outcome = outcomes.get(repo) or {
+            "code": 2, "result": None, "exception": "no audit result",
+        }
+        if outcome["exception"] or outcome["result"] is None:
+            reason = outcome["exception"] or (
+                "repository audit failed (exit %d)" % outcome["code"])
+            errors.append({"repository": repo, "error": reason})
+            continue
+
+        result = outcome["result"]
+        tags = result["tags"]
+        blobs = result["blobs"]
+        summary = {
+            "repository": repo,
+            "state": result["state"],
+            "verdict": result["verdict"],
+            "problems": len(result["problems"]),
+            "warnings": len(result["warnings"]),
+            "tag_expiration_s": result["tag_expiration_s"],
+            "tags": {
+                "rows": tags["total"],
+                "unique_names": tags["unique_names"],
+                "active_names": tags["active_names"],
+                "gc_eligible_rows": tags.get("gc_eligible_rows",
+                                              tags["gc_eligible"]),
+                "pending_rows": tags.get("pending_rows",
+                                         tags["expired_pending_gc"]),
+                "expired_rows": tags["expired_rows"],
+            },
+            "blobs": {
+                "unique": blobs["unique"],
+                "present": blobs["present"],
+                "missing": blobs["missing"],
+                "size_mismatch": blobs["size_mismatch"],
+                "unchecked": blobs["unchecked"],
+                "skipped": blobs["skipped"],
+                "bytes_referenced": blobs["bytes_referenced"],
+            },
+            "logs": (result["logs"]["counts"] if result["logs"] else None),
+        }
+        summaries.append(summary)
+        totals["tags_rows"] += summary["tags"]["rows"]
+        totals["tags_unique_names"] += summary["tags"]["unique_names"]
+        totals["tags_active_names"] += summary["tags"]["active_names"]
+        totals["tags_gc_eligible_rows"] += summary["tags"]["gc_eligible_rows"]
+        totals["tags_pending_rows"] += summary["tags"]["pending_rows"]
+        totals["tags_expired_rows"] += summary["tags"]["expired_rows"]
+        totals["blobs_unique"] += summary["blobs"]["unique"]
+        totals["blobs_present"] += summary["blobs"]["present"]
+        totals["blobs_missing"] += summary["blobs"]["missing"]
+        totals["blobs_size_mismatch"] += summary["blobs"]["size_mismatch"]
+        totals["blobs_unchecked"] += summary["blobs"]["unchecked"]
+        totals["blobs_skipped"] += summary["blobs"]["skipped"]
+        totals["bytes_referenced"] += summary["blobs"]["bytes_referenced"]
+
+    problems_repos = sum(1 for s in summaries if s["problems"])
+    warnings_repos = sum(1 for s in summaries if s["warnings"])
+    incomplete_repos = sum(1 for s in summaries if s["verdict"] == "INCOMPLETE")
+    with_findings = sum(
+        1 for s in summaries
+        if s["problems"] or s["warnings"] or s["verdict"] != "OK")
+    with_findings += len(errors)
+
+    if errors or problems_repos:
+        verdict = "PROBLEM"
+    elif incomplete_repos:
+        verdict = "INCOMPLETE"
+    else:
+        verdict = "OK"
+
+    aggregate = {
+        "org": org,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "repositories": summaries,
+        "errors": errors,
+        "totals": totals,
+        "with_findings": with_findings,
+        "problems_repositories": problems_repos,
+        "warning_repositories": warnings_repos,
+        "incomplete_repositories": incomplete_repos,
+        "truncated": truncated,
+        "verdict": verdict,
+    }
+
+    if json_output:
+        print(json.dumps(aggregate, indent=2, sort_keys=False))
+    else:
+        print("")
+        print("### gc-audit: %s" % org)
+        repo_width = max(
+            [len(s["repository"]) for s in summaries]
+            + [len(e["repository"]) for e in errors] + [1])
+        shown = 0
+        if errors:
+            print("")
+            print("### repositories with errors")
+            for item in errors:
+                print("  %s: %s" % (item["repository"], item["error"]))
+                shown += 1
+
+        for summary in summaries:
+            if only_problems and not (summary["problems"] or summary["warnings"]
+                                      or summary["verdict"] != "OK"):
+                continue
+            status = summary["verdict"]
+            if status == "OK" and summary["warnings"]:
+                status = "OK(warn)"
+            print("  %-*s %-11s tags rows=%d names=%d active=%d gc=%d | "
+                  "blobs unique=%d present=%d missing=%d mismatch=%d "
+                  "unchecked=%d | %s"
+                  % (repo_width, summary["repository"], status,
+                     summary["tags"]["rows"], summary["tags"]["unique_names"],
+                     summary["tags"]["active_names"],
+                     summary["tags"]["gc_eligible_rows"],
+                     summary["blobs"]["unique"], summary["blobs"]["present"],
+                     summary["blobs"]["missing"],
+                     summary["blobs"]["size_mismatch"],
+                     summary["blobs"]["unchecked"],
+                     _gc_fmt_bytes(summary["blobs"]["bytes_referenced"])))
+            shown += 1
+        if only_problems and shown == 0:
+            print("  (no repository with findings)")
+
+        print("")
+        print("### summary: %s" % org)
+        print("  repositories=%d with_findings=%d errors=%d"
+              % (len(repos), with_findings, len(errors)))
+        print("  tags rows=%d unique_names=%d active_names=%d "
+              "gc_eligible_rows=%d pending_rows=%d"
+              % (totals["tags_rows"], totals["tags_unique_names"],
+                 totals["tags_active_names"], totals["tags_gc_eligible_rows"],
+                 totals["tags_pending_rows"]))
+        print("  blobs unique(repo-sum)=%d present=%d missing=%d "
+              "size_mismatch=%d unchecked=%d skipped=%d"
+              % (totals["blobs_unique"], totals["blobs_present"],
+                 totals["blobs_missing"], totals["blobs_size_mismatch"],
+                 totals["blobs_unchecked"], totals["blobs_skipped"]))
+        print("  bytes(repo-sum)=%s" % _gc_fmt_bytes(totals["bytes_referenced"]))
+        if truncated:
+            print("  ** repository list was truncated by the API/page limit")
+        print("")
+        print("VERDICT: %s" % verdict)
+        print("  - all totals are sums per repository: a shared blob or tag name "
+              "is counted once per repository, not once globally.")
+
+    if errors:
+        return 2
+    if fail_on_problem and problems_repos:
         return 1
+    return 0
+
+
+def cmd_list_organizations(registry_url, Port, username=None, password=None,
+                           token=None, all_orgs=False, json_output=False):
+    """
+    List organizations visible to the credential.
+
+    Default: GET /api/v1/user/ -> organizations the user is a member of (plus
+    configured public namespaces).  --all: GET /api/v1/superuser/organizations/
+    -> every organization; this needs a superuser and a fresh login.
+    """
+    if all_orgs:
+        apipath = "/api/v1/superuser/organizations/"
+        source = "superuser"
+    else:
+        apipath = "/api/v1/user/"
+        source = "current_user"
+
+    r = api_get(registry_url, Port, apipath, username, password, token)
+    if r.status_code != 200:
+        describe_response(r, apipath)
+        if r.status_code == 403 and all_orgs:
+            printstderr("   -> --all requires a superuser credential and a fresh login; "
+                        "-T remains the reliable path.")
+        return 1
+    try:
+        data = r.json()
+    except ValueError:
+        printstderr("** list-organizations: API returned invalid JSON")
+        return 1
+
+    orgs = data.get("organizations") or []
+    if not isinstance(orgs, list):
+        orgs = []
+
+    if json_output:
+        print(json.dumps({
+            "source": source,
+            "organizations": orgs,
+        }, indent=2, sort_keys=False))
+        return 0
+
+    title = "all organizations (superuser)" if all_orgs else "organizations (current user)"
+    print("### %s" % title)
+    if not orgs:
+        print("  none")
+        return 0
+
+    rows = []
+    for org in orgs:
+        if not isinstance(org, dict):
+            continue
+        name = org.get("name") or org.get("username") or "?"
+        flags = []
+        if org.get("is_org_admin"):
+            flags.append("admin")
+        if org.get("public"):
+            flags.append("public")
+        rows.append((name, ",".join(flags)))
+    name_width = max([len(name) for name, _flags in rows] or [1])
+    for name, flags in sorted(rows):
+        line = "  %-*s" % (name_width, name)
+        if flags:
+            line += "  " + flags
+        print(line)
     return 0
 
 
@@ -2318,37 +2660,78 @@ def cmd_search_v1(registry_url, Port, term, username=None, password=None,
     if not describe_response(r, "/v1/search?q=%r" % term):
         return None
     d = r.json()
-    results = d.get("results") or d.get("result") or []
+    results = list(d.get("results") or d.get("result") or [])
     npages = int(d.get("num_pages") or 1)
-    print("### /v1/search  q=%r  page=%s/%s  this page=%d results"
-          % (term or "*", d.get("page", 1), npages, len(results)))
-    if results:
-        print("    entry keys: %s" % sorted(results[0].keys()))
-    for it in results:
-        nm = it.get("name") or it.get("repo_name") or json.dumps(it)[:80]
-        line = "  " + nm
-        if show_desc:
-            line += "   " + (it.get("description") or "")[:60]
-        print(line)
-    # paginate
-    total = len(results)
     page = int(d.get("page") or 1)
+
+    # Collect all requested pages first, then print one sorted table.  The old
+    # code printed page 1 with descriptions but later pages as bare names.
+    pages_fetched = 1
     while page < npages and (pages_wanted == 0 or page < pages_wanted):
         page += 1
         rr = requests.get(base + "/v1/search", headers=hdrs,
-                          params={"q": term or "", "page": page, "n": 100}, timeout=30)
+                          params={"q": term or "", "page": page, "n": 100},
+                          timeout=30)
         if rr.status_code != 200:
             printstderr("** page %d -> HTTP %d, stopping" % (page, rr.status_code))
             break
         dd = rr.json()
         rs = dd.get("results") or dd.get("result") or []
-        for it in rs:
-            print("  " + (it.get("name") or it.get("repo_name") or "?"))
-        total += len(rs)
         if not rs:
             break
-    print("# TOTAL collected: %d (%d pages)" % (total, page))
-    return results
+        results.extend(rs)
+        pages_fetched += 1
+
+    # Deduplicate and sort naturally, so postgresql-9/10/12 are in numeric order.
+    by_name = {}
+    for item in results:
+        name = item.get("name") or item.get("repo_name")
+        if name:
+            by_name[name] = item
+
+    def _natural_key(value):
+        return [int(part) if part.isdigit() else part.lower()
+                for part in re.split(r"(\d+)", str(value))]
+
+    ordered = [by_name[name] for name in sorted(by_name, key=_natural_key)]
+
+    print("### /v1/search q=%r  results=%d  pages=%d/%d"
+          % (term or "*", len(ordered), pages_fetched, npages))
+    if not ordered:
+        print("  (no result)")
+    else:
+        rows = []
+        for item in ordered:
+            name = item.get("name") or item.get("repo_name") or "?"
+            if "is_public" in item:
+                visibility = "public" if item["is_public"] else "private"
+            else:
+                visibility = "-"
+            description = (item.get("description") or "").replace("\n", " ").strip()
+            if show_desc and len(description) > 80:
+                description = description[:77] + "..."
+            rows.append((name, visibility, description))
+
+        name_width = max(len("NAME"), max(len(row[0]) for row in rows))
+        vis_width = max(len("VIS"), max(len(row[1]) for row in rows))
+        if show_desc:
+            print(("  %-*s  %-*s  %s"
+                   % (name_width, "NAME", vis_width, "VIS", "DESCRIPTION")).rstrip())
+            for name, visibility, description in rows:
+                line = "  %-*s  %-*s  %s" % (
+                    name_width, name, vis_width, visibility, description)
+                print(line.rstrip())
+        else:
+            print(("  %-*s  %-*s"
+                   % (name_width, "NAME", vis_width, "VIS")).rstrip())
+            for name, visibility, _description in rows:
+                print(("  %-*s  %-*s"
+                       % (name_width, name, vis_width, visibility)).rstrip())
+
+    if debug and results:
+        print("  entry keys: %s" % sorted(results[0].keys()))
+    print("# total: %d result(s) from %d page(s)" % (len(ordered), pages_fetched))
+    return ordered
 
 
 def v2_credential_accepted(registry_url, Port, auth_header, timeout=15):
@@ -2420,6 +2803,7 @@ API_HEADERS = None    # fork: header set for /api/v1, ONLY from explicit user in
 # deletes an org, repo, robot or mirror.
 # ---------------------------------------------------------------------------
 SESSION = None      # requests.Session holding the Quay session cookie
+SESSION_LOCK = threading.Lock()  # serialize shared-session GETs (gc-audit --all-repos)
 CSRF = None         # X-CSRF-Token value for the current session
 
 
@@ -2640,87 +3024,95 @@ def cmd_org_exists(registry_url, Port, names):
     return yes, no
 
 
+def _print_help_section(title, rows, width=None):
+    if width is None:
+        width = max(len(name) for name, _desc in rows)
+    print("")
+    print(title + ":")
+    for name, desc in rows:
+        print("  %-*s  %s" % (width, name, desc))
+
+
 def display_help():
-    print("Usage: %s     " % (sys.argv[0] ))
-    print(f"Version: {VERSION}")
-    print("Command       ")
-    print("  get-server-certificate           : display the pem file of the server ")
+    prog = os.path.basename(sys.argv[0]) or "quayregistryclient"
+    print("Usage: %s <command> [options]" % prog)
+    print("Version: %s" % VERSION)
+    print("Run '%s <command> -h' for command-specific options." % prog)
+
+    sections = [
+        ("Registry and images", [
+            ("list-catalog", "list repositories visible through /v2/_catalog"),
+            ("list-tags", "list tags of a repository (-i)"),
+            ("list-all", "list repositories, tags and digests"),
+            ("get-image-digest", "manifest digest for a tag (-i, -t)"),
+            ("get-image-manifest", "raw manifest JSON (-i, -D)"),
+            ("get-blob", "download a blob (-i, -D)"),
+            ("search-v1", "registry V1 search (what podman search uses)"),
+            ("interactive", "ncurses browser for repositories, tags, manifests and blobs"),
+        ]),
+        ("Quay API and inventory", [
+            ("browse-api", "GET an arbitrary /api/v1 path (-a) and print JSON"),
+            ("quay-api-discovery", "GET /api/v1/discovery"),
+            ("whoami", "show the identity behind the credential"),
+            ("list-organizations", "list organizations (current user by default; --all for superuser)"),
+            ("list-org-repos", "list repositories of an organization (-o)"),
+            ("org-robots", "list robot accounts of an organization (-o)"),
+            ("repo-view", "repository state, visibility and metadata (-i)"),
+            ("quay-config", "public runtime config from /config (no auth)"),
+            ("org-exists", "probe candidate org names (--orgs); 200=exists, 404=absent"),
+        ]),
+        ("Mirroring, retention and GC", [
+            ("mirror-get", "mirror config + GC/retention policies for one repository (-i)"),
+            ("mirror-scan", "mirror inventory for an organization (-o), with health/perimeter/robots"),
+            ("gc-audit", "GC/blob audit for one repository (-i) or all repos of an org (-o --all-repos)"),
+        ]),
+        ("Diagnostics", [
+            ("get-server-certificate", "print the TLS certificate chain served by the registry"),
+        ]),
+        ("Quay superuser API (superuser; -T recommended)", [
+            ("quay-api-listuser", "list users and organizations (-T recommended; fresh web session may work)"),
+            ("quay-api-create-user", "create a user (write; disabled by READ_ONLY)"),
+            ("quay-api-delete-user", "delete a user (write; disabled by READ_ONLY)"),
+            ("quay-api-change-userpassword", "change a user password (write; disabled by READ_ONLY)"),
+        ]),
+        ("Destructive commands (disabled while READ_ONLY=True)", [
+            ("delete-repo", "delete one repository (-i)"),
+            ("delete-tag", "delete one tag (-i, -t)"),
+            ("delete-all-repo", "delete every repository after a countdown and confirmation"),
+            ("set-api-key-value", "PUT one key/value on an API path (-a, -K, -V)"),
+        ]),
+    ]
+    command_width = max(len(name) for _title, rows in sections for name, _desc in rows)
+    for title, rows in sections:
+        _print_help_section(title, rows, command_width)
+
+    _print_help_section("Common options", [
+        ("-r, --registry-url URL", "registry host (e.g. quay.io, registry.example.com)"),
+        ("-P, --port PORT", "registry TCP port (default: 443)"),
+        ("-u, --username USER", "Quay/registry username"),
+        ("-p, --password PASS", "Quay/registry password"),
+        ("-i, --image-name ORG/REPO", "repository name"),
+        ("-t, --tag TAG", "tag name (default: latest)"),
+        ("-T, --token TOKEN", "Quay API token (-T) or bearer token"),
+        ("-D, --digest DIGEST", "image digest (sha256:...)"),
+        ("-o, --org ORG", "organization name"),
+        ("-a, --apipath PATH", "API path for browse-api"),
+        ("-K, --key KEY", "key for set-api-key-value"),
+        ("-V, --value VALUE", "value for set-api-key-value"),
+        ("-q, --query TERM", "search term for search-v1"),
+        ("-d, --debug", "print equivalent curl commands and diagnostics on stderr"),
+        ("--show-secrets", "do not redact secret-bearing API fields"),
+    ])
+
+    _print_help_section("Special options", [
+        ("-h, --help", "show this help, or a command's help after the command name"),
+        ("--generate-completion", "print the bash completion script and exit"),
+    ])
+
     print("")
-    print("  browse-api                       : query quay api and display the json ")
-    print("  quay-api-discovery               : query the quay api endpoint /api/v1/discovery and output the json ")
-    print("    # SUPERUSER API with token required to be passed as <-T token> for authentication")
-    print("    quay-api-listuser                : query the quay api endpoint /api/v1/superuser/users/ and output the json ")
-    print("    quay-api-delete-user             : delete a user from the quay api endpoint /api/v1/superuser/users/ <-u username> ")
-    print("    quay-api-create-user             : create a user from the quay api endpoint /api/v1/superuser/users/ <-u username> ")
-    print("    quay-api-change-userpassword     : create a user from the quay api endpoint /api/v1/superuser/users/ <-u username> <-p password>")
-    print("")
-    print("  list-catalog                    : list all image in a repository querying /v2/_catalog")
-    print("  list-tags                       : list all tag for a given image <-i imagename> required ")
-    print("  list-all                        : list all image, tag and digest ")
-    print("  get-image-manifest              : fetch manifest JSON for an image <-i imagename> <-D digest> required")
-    print("  get-image-digest                : give the digest of an image <-i imagename> and <-t tag> required ")
-    print("  get-blob                        : fetch a blob for an image <-i imagename> <-D digest> required")
-    print("  delete-repo                     : delete one repository <-i imagename> required")
-    print("  delete-tag                      : delete one tag <-i imagename> <-t tag> required")
-    print("  delete-all-repo                 : delete all repositories after a 10s countdown (requires --i-am-deleting-all-repo)")
-    print("  set-api-key-value               : set one key=value on an API path <-a apipath> <-K key> <-V value> required")
-    print("  interactive                     : browse repositories, tags, manifests and blobs in a ncurses UI")
-    print("")
-    print("  ## READ-ONLY QUAY MIRRORING API (this fork; no credentials are printed)      ##")
-    print("  quay-config                     : effective runtime config from public /config (no auth) [-r]")
-    print("  whoami                          : which identity is this credential (LDAP vs robot) [-r -u/-p or -T]")
-    print("  list-org-repos                  : list repos of an org <-o org> (Quay way: /v2/_catalog is EMPTY)")
-    print("  org-robots                      : list the robots of an org <-o org> (mirroring robots)")
-    print("  repo-view                       : repo view: gives state NORMAL/MIRROR <-i org/repo>")
-    print("  mirror-get                      : mirror config + GC/retention policies of ONE repo <-i org/repo>")
-    print("  mirror-scan                     : per-repo mirror inventory of an org <-o org>")
-    print("                                    + HEALTH / PERIMETRE / ROBOTS aggregates  [--only-problems] [--max-repos N]")
-    print("  gc-audit                        : read-only GC/blob audit of ONE repo <-i org/repo>")
-    print("                                    tags pending GC, auto-prune policies, missing blobs")
-    print("                                    [--only-problems] [--no-blob-check] [--json] [--logs-days N]")
-    print("  org-exists                      : ORACLE (anonymous) <-o? no, --orgs a,b,c>")
-    print("                                    200=exists / 404=absent; no org list is hardcoded")
-    print("  search-v1                       : registry V1 search (what `podman search` calls)")
-    print("")
-    print("  /api/v1 auth modes (Basic is REFUSED by the Quay frontend, 401 invalid_token):")
-    print("    1. -T token / QRC_TOKEN=...    OAuth app token (the per-org 'ansible' app,")
-    print("                                   what quay_api_token.py hands the modules)")
-    print("    2. QRC_COOKIE='session=...'    replay a browser session cookie")
-    print("    3. -u/-p or QRC_USERNAME/QRC_PASSWORD")
-    print("                                   WEB LOGIN: GET /csrf_token then")
-    print("                                   POST /api/v1/signin -> session cookie.")
-    print("                                   This is exactly what the infra.quay_configuration")
-    print("                                   collection does (api_module.py::authenticate),")
-    print("                                   and the reason your Ansible job works here.")
-    print("                                   Credentials read from the credential store are")
-    print("                                   replayed to POST /api/v1/signin BY DEFAULT.")
-    print("                                   Set QRC_ALLOW_STORE_WEB_LOGIN=0 to forbid it.")
-    print("                                   WARNING: a failed /signin bumps")
-    print("                                   invalid_login_attempts on that account -- often")
-    print("                                   the shared service account carrying every")
-    print("                                   mirror (--src-creds); a typo can lock mirroring")
-    print("                                   platform-wide.")
-    print("")
-    print("  ## READ-ONLY MODE: delete-*/set-api-key-value/create-user/delete-user/change-userpassword are DISABLED ##")
-    print("Options            ")
-    print("  <-r registry_url>")
-    print("  <-u username>    ")
-    print("  <-p password>    ")
-    print("  <-P tcpPort>     ")
-    print("  <-i imageName>   ")
-    print("  <-a apipath>     ")
-    print("  <-K key>         ")
-    print("  <-V value>       ")
-    print("  <-t tag>         ")
-    print("  <-T token>       ")
-    print("  <-D digest>      ")
-    print("  <-d>                    : for debugging purpose")
-    print("")
-    print("Special Options")
-    print("  -h, --help                   : show this help, or the help of one command")
-    print("                                  (e.g. quayregistryclient mirror-scan -h)")
-    print("  --generate-completion        : generate bash completion script and exit")
-    print("                                  (source the output to enable tab completion)")
+    print("Examples:")
+    print("  %s search-v1 -r quay.io -q ubi" % prog)
+    print("  %s search-v1 -r quay.io -q postgres --pages 2 --desc" % prog)
 
 
 def generate_bash_completion():
@@ -2735,7 +3127,7 @@ _quayregistryclient() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     cmd="${COMP_WORDS[1]}"
 
-    local commands="list-catalog list-tags list-all get-image-digest get-image-manifest get-blob delete-repo delete-tag delete-all-repo browse-api quay-api-discovery quay-api-listuser quay-api-delete-user quay-api-create-user quay-api-change-userpassword set-api-key-value get-server-certificate quay-config whoami list-org-repos org-robots repo-view mirror-get mirror-scan gc-audit search-v1 org-exists interactive"
+    local commands="list-catalog list-tags list-all get-image-digest get-image-manifest get-blob delete-repo delete-tag delete-all-repo browse-api quay-api-discovery quay-api-listuser quay-api-delete-user quay-api-create-user quay-api-change-userpassword set-api-key-value get-server-certificate quay-config whoami list-organizations list-org-repos org-robots repo-view mirror-get mirror-scan gc-audit search-v1 org-exists interactive"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "${commands}" -- ${cur}) )
@@ -2770,11 +3162,11 @@ _quayregistryclient() {
             COMPREPLY=()
             return 0
             ;;
-        --max-tags|--logs-days|--jobs)
+        --max-tags|--logs-days|--jobs|--repo-jobs|-o|--org)
             COMPREPLY=()
             return 0
             ;;
-        -d|-h)
+        -d|-h|--persist-connection|--no-persist-connection)
             COMPREPLY=()
             return 0
             ;;
@@ -2861,6 +3253,9 @@ _get_options_for_command() {
         list-org-repos|org-robots)
             echo "-r -P -o -u -p -T -d --show-secrets -h"
             ;;
+        list-organizations)
+            echo "-r -P -u -p -T -d --all --json -h"
+            ;;
         repo-view|mirror-get)
             echo "-r -P -i -u -p -T -d --show-secrets -h"
             ;;
@@ -2868,7 +3263,7 @@ _get_options_for_command() {
             echo "-r -P -o -u -p -T -d --show-secrets --only-problems --max-repos --offset -h"
             ;;
         gc-audit)
-            echo "-r -P -i -u -p -T -d --json --only-problems --no-blob-check --max-tags --logs-days --jobs --fail-on-problem --show-tags -h"
+            echo "-r -P -i -o --all-repos -u -p -T -d --json --only-problems --no-blob-check --max-tags --logs-days --jobs --repo-jobs --persist-connection --no-persist-connection --fail-on-problem --show-tags -h"
             ;;
         search-v1)
             echo "-r -P -q --pages --desc -u -p -T -d -h"
@@ -3074,7 +3469,7 @@ SUBCOMMAND_DESCRIPTIONS = {
     'delete-all-repo': 'DESTRUCTIVE: delete every repository in the registry.',
     'browse-api': 'GET an arbitrary Quay API path and print the (redacted) JSON answer.',
     'quay-api-discovery': 'Call GET /api/v1/discovery and print the JSON answer.',
-    'quay-api-listuser': 'List every user (superuser API).',
+    'quay-api-listuser': 'List every user (superuser API; -T recommended, fresh web session may work).',
     'quay-api-delete-user': 'Delete a user (superuser API).',
     'quay-api-create-user': 'Create a user (superuser API).',
     'quay-api-change-userpassword': 'Change a user password (superuser API).',
@@ -3082,12 +3477,13 @@ SUBCOMMAND_DESCRIPTIONS = {
     'get-server-certificate': 'Print the TLS certificate chain served by the registry.',
     'quay-config': 'Print the effective runtime config from the public /config endpoint.',
     'whoami': 'Show which identity the credential resolves to (LDAP user vs robot).',
+    'list-organizations': 'List organizations visible to the credential (current user by default; --all for superuser).',
     'list-org-repos': 'List the repositories of an organization.',
     'org-robots': 'List the robot accounts of an organization.',
     'repo-view': 'Repository view: state NORMAL/MIRROR, description, tags.',
     'mirror-get': 'Mirror config + GC/retention policies of ONE repository.',
     'mirror-scan': 'Per-repo mirror inventory of an org with health/perimeter/robot aggregates.',
-    'gc-audit': 'Read-only GC/blob audit of ONE repository: tags pending GC, blob presence, sparse children.',
+    'gc-audit': 'Read-only GC/blob audit of ONE repository or every repository of an org.',
     'search-v1': 'Registry V1 search (what `podman search` calls).',
     'org-exists': 'Probe candidate organization names (200=exists / 404=absent).',
     'interactive': 'Browse repositories, tags and blobs in a ncurses UI.',
@@ -3109,13 +3505,17 @@ OPTION_HELP = {
     'debug': 'Enable debug mode',
     'show_secrets': 'Do not redact secrets in the output (default: masked)',
     'org': 'Organization name (e.g., myorg)',
+    'all_repos': 'Audit every repository of -o ORG (gc-audit)',
     'only_problems': 'Text output only: show unhealthy mirrors, or GC-relevant tags/blobs',
     'max_repos': 'Limit the number of repositories inspected (0 = all)',
-    'json': 'Machine-readable JSON output (gc-audit)',
+    'json': 'Machine-readable JSON output',
+    'all_orgs': 'List every organization (superuser + fresh login)',
     'no_blob_check': 'Metadata only: do not HEAD blobs on /v2 (gc-audit)',
     'max_tags': 'Maximum number of tags audited (0 = all)',
     'logs_days': 'Fetch recent tag/policy audit logs for N days (0 = off)',
-    'jobs': 'Parallel blob HEAD requests',
+    'jobs': 'Parallel blob HEAD requests per repository',
+    'repo_jobs': 'Parallel repository audits in --all-repos mode',
+    'persist_connection': 'Reuse HTTP connections per thread (enabled by default)',
     'fail_on_problem': 'Exit 1 when missing blobs, size mismatches or manifest errors are found',
     'show_tags': 'List active tags even with --only-problems',
     'offset': 'Skip the first N repositories (chunk long scans)',
@@ -3250,13 +3650,33 @@ def create_parser():
     sp_discovery.add_argument('--show-secrets', action='store_true',
                               help='do not redact secrets in the API response')
 
-    sp_listuser = subparsers.add_parser('quay-api-listuser', help='List Quay users via superuser API')
+    sp_listuser = subparsers.add_parser(
+        'quay-api-listuser',
+        help='List Quay users via superuser API (-T recommended; web session may work)')
     sp_listuser.add_argument('-r', '--registry-url', required=True)
     sp_listuser.add_argument('-P', '--port', default='443')
-    sp_listuser.add_argument('-T', '--token', required=True)
+    sp_listuser.add_argument('-u', '--username')
+    sp_listuser.add_argument('-p', '--password')
+    sp_listuser.add_argument('-T', '--token',
+                             help='superuser OAuth token (recommended); '
+                                  'a fresh superuser session may also work')
     sp_listuser.add_argument('-d', '--debug', action='store_true')
     sp_listuser.add_argument('--show-secrets', action='store_true',
                              help='do not redact secrets in the API response')
+
+    sp_orgs = subparsers.add_parser(
+        'list-organizations',
+        help='List organizations (current user by default; --all needs superuser)')
+    sp_orgs.add_argument('-r', '--registry-url', required=True)
+    sp_orgs.add_argument('-P', '--port', default='443')
+    sp_orgs.add_argument('-u', '--username')
+    sp_orgs.add_argument('-p', '--password')
+    sp_orgs.add_argument('-T', '--token')
+    sp_orgs.add_argument('--all', dest='all_orgs', action='store_true',
+                         help='list every organization (superuser + fresh login)')
+    sp_orgs.add_argument('--json', action='store_true',
+                         help='print the API organizations array as JSON')
+    sp_orgs.add_argument('-d', '--debug', action='store_true')
 
     sp_deluser = subparsers.add_parser('quay-api-delete-user', help='Delete a Quay user via superuser API')
     sp_deluser.add_argument('-r', '--registry-url', required=True)
@@ -3306,7 +3726,15 @@ def create_parser():
         ('search-v1', 'registry V1 search (what `podman search` calls) - the working enumeration here'),
         ('org-exists', 'ORACLE (anonymous): probe candidate org names, 200=exists / 404=absent'),
     ]:
-        sp = subparsers.add_parser(name, help=hlp)
+        sp = subparsers.add_parser(
+            name, help=hlp,
+            formatter_class=(argparse.RawDescriptionHelpFormatter
+                             if name == 'search-v1' else argparse.HelpFormatter),
+            epilog=("Examples:\n"
+                    "  quayregistryclient search-v1 -r quay.io -q ubi\n"
+                    "  quayregistryclient search-v1 -r quay.io -q postgres --pages 2 --desc\n"
+                    if name == 'search-v1' else None),
+        )
         sp.add_argument('-r', '--registry-url', required=True)
         sp.add_argument('-P', '--port', default='443')
         sp.add_argument('-u', '--username')
@@ -3343,7 +3771,12 @@ def create_parser():
     sp_gc.add_argument('-u', '--username')
     sp_gc.add_argument('-p', '--password')
     sp_gc.add_argument('-T', '--token')
-    sp_gc.add_argument('-i', '--image-name', required=True, help='org/repo, e.g. myorg/myrepo')
+    sp_gc.add_argument('-i', '--image-name',
+                       help='org/repo for a single audit, e.g. myorg/myrepo')
+    sp_gc.add_argument('-o', '--org',
+                       help='organization for --all-repos, e.g. myorg')
+    sp_gc.add_argument('--all-repos', action='store_true',
+                       help='audit every repository of -o ORG and print a summary')
     sp_gc.add_argument('-d', '--debug', action='store_true')
     sp_gc.add_argument('--json', action='store_true',
                        help='machine-readable JSON on stdout (text output is disabled)')
@@ -3356,7 +3789,15 @@ def create_parser():
     sp_gc.add_argument('--logs-days', type=int, default=0,
                        help='also fetch tag-deletion audit logs for the last N days (0 = off)')
     sp_gc.add_argument('--jobs', type=int, default=8,
-                       help='parallel blob HEAD requests (default: 8)')
+                       help='parallel blob HEAD requests per repository (default: 8)')
+    sp_gc.add_argument('--repo-jobs', type=int, default=4,
+                       help='parallel repository audits in --all-repos mode (default: 4)')
+    sp_gc.add_argument('--persist-connection', dest='persist_connection',
+                       action='store_true', default=True,
+                       help='reuse HTTP connections per thread (default: enabled)')
+    sp_gc.add_argument('--no-persist-connection', dest='persist_connection',
+                       action='store_false',
+                       help='disable HTTP connection reuse (one session per request)')
     sp_gc.add_argument('--fail-on-problem', action='store_true',
                        help='exit 1 when missing blobs, size mismatches or manifest errors are found')
     sp_gc.add_argument('--show-tags', action='store_true',
@@ -4000,6 +4441,10 @@ def main():
     global debug
     debug = 1 if args.debug else None
 
+    global PERSIST_CONNECTION
+    if hasattr(args, 'persist_connection'):
+        PERSIST_CONNECTION = bool(args.persist_connection)
+
     # fork: opt-in secret reveal (default OFF -> upstream LDAP login is masked)
     global SHOW_SECRETS
     if getattr(args, 'show_secrets', False):
@@ -4112,7 +4557,8 @@ def main():
     # -T token) -- the stored /v2 credential is refused by the Quay frontend.
     # Fail once, up front, instead of printing misleading empty results.
     if cmd in ("whoami", "list-org-repos", "org-robots", "repo-view",
-               "mirror-get", "mirror-scan", "gc-audit"):
+               "mirror-get", "mirror-scan", "gc-audit", "quay-api-listuser",
+               "list-organizations"):
         require_api_credential(token, username, password, registry_url, Port)
 
     if cmd == "get-server-certificate":
@@ -4133,11 +4579,24 @@ def main():
             sys.exit(2)
         browseapi(registry_url,Port,token,apipath)
     elif cmd == "quay-api-listuser":
-        if not all([registry_url,Port,token]):
-            token_val="##maskingToken##" if token is not None else token
-            print(f"Error: missing parameters browse-api(registry_url={registry_url},Port={Port},token={token_val}")
-            sys.exit(2)
-        browseapi(registry_url,Port,token,"/api/v1/superuser/users/")
+        if not all([registry_url, Port]):
+            print("Error: quay-api-listuser needs -r"); sys.exit(2)
+        r = api_get(registry_url, Port, "/api/v1/superuser/users/",
+                    username, password, token)
+        if not describe_response(r, "/api/v1/superuser/users/"):
+            if r.status_code == 403:
+                printstderr("   -> superuser endpoint: a superuser credential and a "
+                            "fresh login are required; -T remains the reliable path.")
+            sys.exit(1)
+        print_api_response(r)
+    elif cmd == "list-organizations":
+        if not all([registry_url, Port]):
+            print("Error: list-organizations needs -r"); sys.exit(2)
+        sys.exit(cmd_list_organizations(
+            registry_url, Port, username, password, token,
+            all_orgs=getattr(args, 'all_orgs', False),
+            json_output=getattr(args, 'json', False),
+        ))
     elif cmd == "quay-api-delete-user":
         if not all([registry_url,Port,token,username]):
             token_val="##maskingToken##" if token is not None else token
@@ -4262,8 +4721,31 @@ def main():
                         only_problems=only_problems, max_repos=max_repos,
                         offset=getattr(args, 'offset', 0))
     elif cmd == "gc-audit":
-        if not all([registry_url, Port, imageName]):
-            print("Error: gc-audit needs -r and -i <org/repo>"); sys.exit(2)
+        if not all([registry_url, Port]):
+            print("Error: gc-audit needs -r"); sys.exit(2)
+        all_repos = getattr(args, 'all_repos', False)
+        org = getattr(args, 'org', None)
+        if all_repos:
+            if not org:
+                print("Error: gc-audit --all-repos needs -o <organization>"); sys.exit(2)
+            if imageName:
+                print("Error: gc-audit accepts either -i <org/repo> or "
+                      "-o <org> --all-repos, not both"); sys.exit(2)
+            sys.exit(cmd_gc_audit_all(
+                registry_url, Port, org, username, password, token,
+                json_output=getattr(args, 'json', False),
+                only_problems=getattr(args, 'only_problems', False),
+                blob_check=not getattr(args, 'no_blob_check', False),
+                max_tags=getattr(args, 'max_tags', 200),
+                logs_days=getattr(args, 'logs_days', 0),
+                jobs=getattr(args, 'jobs', 8),
+                repo_jobs=getattr(args, 'repo_jobs', 4),
+                fail_on_problem=getattr(args, 'fail_on_problem', False),
+                show_tags=getattr(args, 'show_tags', False),
+            ))
+        if not imageName:
+            print("Error: gc-audit needs -i <org/repo>, or -o <org> --all-repos")
+            sys.exit(2)
         sys.exit(cmd_gc_audit(
             registry_url, Port, imageName, username, password, token,
             json_output=getattr(args, 'json', False),
